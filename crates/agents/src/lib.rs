@@ -192,10 +192,16 @@ const TAB_DIM: &str = "#565F89";
 const DIVIDER: char = '\u{e0b1}';
 const INK: &str = "#222436";
 
-/// Live agent observations, keyed by Zellij terminal pane id.
+/// Live agent observations, keyed by `(terminal pane id, vendor)`.
+///
+/// Not by pane alone: a pane can host several agents at once — most importantly
+/// when a relay funnels a whole remote session through ONE local pane — and
+/// keying by pane would let each new vendor evict the last. Same vendor twice in
+/// one pane still merges, which is the right granularity for a display that shows
+/// one icon per vendor.
 #[derive(Default, Debug)]
 pub struct Agents {
-    entries: HashMap<u32, Entry>,
+    entries: HashMap<(u32, Kind), Entry>,
 }
 
 impl Agents {
@@ -211,22 +217,23 @@ impl Agents {
     /// producer saying the agent is finished with the pane, `Idle` is the
     /// status vocabulary's own "nothing to report", and neither earns a glyph.
     pub fn apply(&mut self, payload: &StatusPayload, now: u64) -> bool {
+        let kind = Kind::from_source(&payload.source);
         if payload.gone || payload.status == Status::Idle {
-            return self.entries.remove(&payload.pane_id).is_some();
+            return self.entries.remove(&(payload.pane_id, kind)).is_some();
         }
         let entry = Entry {
-            kind: Kind::from_source(&payload.source),
+            kind,
             status: payload.status,
             seen: now,
         };
-        self.entries.insert(payload.pane_id, entry) != Some(entry)
+        self.entries.insert((payload.pane_id, kind), entry) != Some(entry)
     }
 
     /// Drop observations whose pane no longer exists. A closed terminal takes
     /// its agent with it, and no producer gets to run a hook on the way out.
     pub fn retain_panes(&mut self, live: &HashSet<u32>) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|pane_id, _| live.contains(pane_id));
+        self.entries.retain(|(pane_id, _), _| live.contains(pane_id));
         self.entries.len() != before
     }
 
@@ -244,7 +251,7 @@ impl Agents {
         let mut lines: Vec<(u32, String)> = self
             .entries
             .iter()
-            .map(|(pane_id, entry)| {
+            .map(|((pane_id, _), entry)| {
                 (
                     *pane_id,
                     to_wire(&StatusPayload {
@@ -352,28 +359,38 @@ impl Agents {
         self.entries.values().any(|e| e.status == Status::Running)
     }
 
-    /// The worst status among one tab's panes, with how many agents it holds, or
-    /// `None` when the tab has no agent.
-    fn tab_status(
+    /// Every vendor at work in one tab, worst-status-first — not just the single
+    /// worst one. A tab running Claude *and* waiting on Codex has two things to
+    /// say, and collapsing them to the louder one hides the other outright.
+    ///
+    /// Grouping walks `Kind::ALL` rather than hashing `Kind`; the list is short and
+    /// its order is the tiebreak for vendors sharing a status.
+    fn tab_clusters(
         &self,
         position: usize,
         pane_tab: &HashMap<u32, usize>,
-    ) -> Option<(Kind, Status, usize)> {
-        let mut worst: Option<(Kind, Status)> = None;
-        let mut count = 0usize;
-        for (pane_id, entry) in &self.entries {
-            if pane_tab.get(pane_id) != Some(&position) {
-                continue;
-            }
-            count += 1;
-            // `Status` is ascending-severity and derives `Ord`, so this IS the
-            // documented priority: error > pending > running > done.
-            if worst.is_none_or(|(_, w)| entry.status > w) {
-                worst = Some((entry.kind, entry.status));
-            }
-        }
-        worst.map(|(kind, status)| (kind, status, count))
+    ) -> Vec<(Kind, Status, usize)> {
+        let mut clusters: Vec<(Kind, Status, usize)> = Kind::ALL
+            .iter()
+            .filter_map(|&kind| {
+                let mut worst: Option<Status> = None;
+                let mut count = 0usize;
+                for ((pane_id, k), entry) in &self.entries {
+                    if *k != kind || pane_tab.get(pane_id) != Some(&position) {
+                        continue;
+                    }
+                    count += 1;
+                    // `Status` is ascending-severity and derives `Ord`, so `max`
+                    // IS the documented priority: error > pending > running > done.
+                    worst = Some(worst.map_or(entry.status, |w: Status| w.max(entry.status)));
+                }
+                worst.map(|status| (kind, status, count))
+            })
+            .collect();
+        clusters.sort_by_key(|c| std::cmp::Reverse(c.1));
+        clusters
     }
+
 
     /// Render the whole tab strip, replacing zjstatus's own `{tabs}`.
     ///
@@ -414,22 +431,25 @@ impl Agents {
             // sequence could repaint the bar arbitrarily. Core's sanitizer strips
             // control chars, bidi overrides and ANSI/OSC, and caps the width.
             let name = sanitize(&tab.name, MAX_TAB_NAME_CHARS);
-            let agent = self.tab_status(tab.position, pane_tab);
+            let clusters = self.tab_clusters(tab.position, pane_tab);
+            let peak = clusters.first().map(|c| c.1);
             let index = tab.position + 1;
 
             if tab.active {
                 // The block itself says "you are here", so the accent colour is
                 // free to carry the status instead of being spent on selection.
-                let accent = agent.map_or(TAB_ACTIVE_BG, |(_, s, _)| role_hex(s.role()));
+                let accent = peak.map_or(TAB_ACTIVE_BG, |s| role_hex(s.role()));
                 // No index on the active tab: it is a jump target, and you cannot
                 // jump to where you already are.
                 out.push_str(&format!("#[fg={INK},bg={accent},bold] "));
-                if let Some((kind, status, count)) = agent {
+                for (kind, status, count) in &clusters {
                     out.push(kind.mark(glyphs));
                     out.push(' ');
-                    out.push_str(&status_glyph(status, glyphs, frame));
-                    push_count(&mut out, count);
+                    out.push_str(&status_glyph(*status, glyphs, frame));
+                    push_count(&mut out, *count);
                     out.push(' ');
+                }
+                if !clusters.is_empty() {
                     out.push(DIVIDER);
                     out.push(' ');
                 }
@@ -439,19 +459,24 @@ impl Agents {
                 out.push_str(&format!(" #[fg={accent},bg={BG}] "));
             } else {
                 out.push_str(&format!("#[fg={TAB_DIM},bg={BG}] {index} "));
-                let name_colour = match agent {
+                let name_colour = match peak {
                     // Needs you: paint the name too, so it is findable without
                     // reading glyphs.
-                    Some((_, s, _)) if s.needs_you() => role_hex(s.role()),
+                    Some(s) if s.needs_you() => role_hex(s.role()),
                     _ => TAB_NAME,
                 };
-                if let Some((kind, status, count)) = agent {
+                for (kind, status, count) in &clusters {
+                    // Each vendor keeps its OWN colour, so a tab that is working
+                    // and also waiting shows both facts rather than one.
                     out.push_str(&format!("#[fg={}]", role_hex(status.role())));
                     out.push(kind.mark(glyphs));
                     out.push(' ');
-                    out.push_str(&status_glyph(status, glyphs, frame));
-                    push_count(&mut out, count);
-                    out.push_str(&format!("#[fg={TAB_DIM}] {DIVIDER} "));
+                    out.push_str(&status_glyph(*status, glyphs, frame));
+                    push_count(&mut out, *count);
+                    out.push(' ');
+                }
+                if !clusters.is_empty() {
+                    out.push_str(&format!("#[fg={TAB_DIM}]{DIVIDER} "));
                 }
                 out.push_str(&format!("#[fg={name_colour}]{name}"));
                 out.push_str(&indicators(tab, TAB_DIM));
@@ -924,6 +949,76 @@ mod tests {
         t.flashing_bell = true;
         let flashing = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
         assert!(flashing.contains("#F7768E"), "flash in error: {flashing:?}");
+    }
+
+    #[test]
+    fn a_tab_shows_every_vendor_at_work_in_it_not_just_the_worst() {
+        // The old behaviour collapsed a tab to its single loudest vendor, which
+        // hid the others outright.
+        let mut agents = Agents::default();
+        agents.apply(&payload(1, "claude", Status::Running), 0);
+        agents.apply(&payload(2, "codex", Status::Pending), 0);
+        let map = in_tab(&[(1, 0), (2, 0)]);
+        for active in [true, false] {
+            let out = agents.render_tabs(&[tab(0, "t", active)], &map, nerd(), 0);
+            assert!(out.contains(Kind::Claude.mark(nerd())), "claude missing (active={active}): {out:?}");
+            assert!(out.contains(Kind::Codex.mark(nerd())), "codex missing (active={active}): {out:?}");
+            // Most urgent first: pending outranks running.
+            assert!(
+                out.find(Kind::Codex.mark(nerd())) < out.find(Kind::Claude.mark(nerd())),
+                "urgent vendor must lead: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_pane_can_host_several_agents() {
+        // A relay funnels a whole remote session through ONE local pane. Keying
+        // observations by pane alone made each vendor evict the last, so only the
+        // most recent remote agent was ever visible.
+        let mut agents = Agents::default();
+        agents.apply(&payload(7, "claude", Status::Running), 0);
+        agents.apply(&payload(7, "codex", Status::Error), 0);
+        agents.apply(&payload(7, "omp", Status::Pending), 0);
+        let out = agents.render_tabs(&[tab(0, "relay", false)], &in_tab(&[(7, 0)]), nerd(), 0);
+        for k in [Kind::Claude, Kind::Codex, Kind::Omp] {
+            assert!(out.contains(k.mark(nerd())), "{k:?} evicted: {out:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_vendor_twice_in_one_pane_still_merges() {
+        // Per-vendor is the display granularity, so a repeat report updates rather
+        // than accumulating.
+        let mut agents = Agents::default();
+        agents.apply(&payload(3, "claude", Status::Running), 0);
+        agents.apply(&payload(3, "claude", Status::Error), 1);
+        let out = agents.render_tabs(&[tab(0, "t", false)], &in_tab(&[(3, 0)]), nerd(), 0);
+        assert_eq!(out.matches(Kind::Claude.mark(nerd())).count(), 1, "{out:?}");
+        assert!(out.contains(Status::Error.glyph_for(nerd())), "latest status wins: {out:?}");
+    }
+
+    #[test]
+    fn closing_a_pane_drops_all_of_its_agents() {
+        let mut agents = Agents::default();
+        agents.apply(&payload(4, "claude", Status::Running), 0);
+        agents.apply(&payload(4, "codex", Status::Pending), 0);
+        assert!(agents.retain_panes(&HashSet::new()));
+        assert!(agents.is_empty(), "both vendors on the dead pane must go");
+    }
+
+    #[test]
+    fn snapshot_round_trips_several_agents_sharing_one_pane() {
+        let mut before = Agents::default();
+        before.apply(&payload(9, "claude", Status::Running), 0);
+        before.apply(&payload(9, "omp", Status::Error), 0);
+        let mut after = Agents::default();
+        after.restore(&before.snapshot(), 0);
+        let map = in_tab(&[(9, 0)]);
+        assert_eq!(
+            after.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0),
+            before.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0)
+        );
     }
 
     #[test]

@@ -20,7 +20,10 @@ macro_rules! kinds {
         ///
         /// Generated from the `kinds!` table below — see it for each variant's
         /// wire token and marks.
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        // `Hash` so consumers can key a map by vendor — the agents plugin keys
+        // observations by `(pane_id, Kind)` because one pane can host several
+        // agents at once (a relay funnelling a remote session through one pane).
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
         pub enum Kind {
             $( $variant ),+
         }
