@@ -1,0 +1,36 @@
+# The headless agent-status aggregator (wasm32-wasip1). Zellij loads plugins as
+# WASI *command* modules — it calls the wasm `_start` export, then `load`. A
+# cdylib builds a *reactor* (no `_start`), which Zellij can't load, so this is a
+# BINARY crate: `register_plugin!`'s generated `fn main` becomes `_start`.
+#
+# Unlike the sidebar plugin this replaced, it never renders: it is loaded once
+# per session via `load_plugins` in config.kdl (start_suppressed, no pane), and
+# republishes a compact string to every zjstatus instance through
+# `pipe_message_to_plugin`. Build with:
+#   cargo build --target wasm32-wasip1 -p zj-radar-agents
+[package]
+name = "zj-radar-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless Zellij plugin that aggregates zj-radar agent status into a zjstatus pipe widget."
+repository.workspace = true
+publish = false
+
+[lib]
+name = "zj_radar_agents"
+
+[[bin]]
+name = "zj_radar_agents"
+path = "src/main.rs"
+
+[dependencies]
+zj-radar-core = { workspace = true }
+
+# Zellij's plugin SDK is only used by the wasm `_start`/`load` wiring (all
+# `#[cfg(target_arch = "wasm32")]`). Scoping it to the wasm target keeps its
+# native transitive chain (zellij-utils → isahc → curl → openssl-sys) out of
+# host builds, and lets `cargo test` run the pure logic in `lib.rs` natively.
+# Pinned exact, in lockstep with the rest of the workspace.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+zellij-tile = "=0.44.3"

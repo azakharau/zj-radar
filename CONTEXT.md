@@ -87,17 +87,13 @@ and the `timer` each stamp `settle: true` on their `RadarChange`; `project` fire
 `notify_effects` exactly on that flag, so the notify call sites line up across every
 handler by construction.
 
-**Cadence** is a related but distinct axis — how often the one-shot timer
-re-fires, not whether it notifies. Two speeds (`PluginRuntime::desired_cadence`):
-Fast (1 Hz) while there's tick-windowed work — `has_running_work` (a spinning
-glyph), an un-carried completion edge (a status-pipe recede/notify deferred to
-the timer because its own focus can't be trusted), a command `Done` awaiting
-its `DONE_TTL_TICKS` recede, or an active ping flash. Slow (1/60 Hz — once a
-minute) once none of that holds but a ledger entry is still un-saturated
-(`ledger_any_unsaturated`): nothing is animating, but a displayed age is still
-changing. Fully disarmed (`None`) once every ledger age has hit `1h+` — the
-saturation cutoff (`## Ledger`) is exactly what lets the timer stop for good
-instead of ticking forever to redraw an age that will never change again.
+**Cadence** is a related but distinct axis — how often the sole one-shot timer
+re-fires, not whether it notifies. `Fast` runs visual frames at 8 Hz while
+there is animated or tick-windowed work; every eighth frame advances the 1 Hz
+domain clock. A named quiet rail uses `Idle`, one domain tick per second for
+peer reads and liveness. An unnamed rail with no work fully disarms. The
+scheduled cadence stored beside that single timeout identifies its callback;
+the host-reported elapsed duration does not.
 
 ## Ledger
 
@@ -307,15 +303,14 @@ unconditionally, paired with that file's mtime age; only a much longer 6h
 open-time sweep at plugin `load()` ever actually deletes one (genuine
 debris). `Sessions` (`sessions.rs`) turns that age into a per-entry
 fresh/stale state (`STALE_AFTER_SECS`, 90s — 50% margin over the 60s
-heartbeat): stale entries dim on the badge and are unreachable via
+heartbeat): stale entries are hidden and unreachable via
 `session-next`/`session-prev` (switching onto a likely-dead session would
-have Zellij resurrect it as an empty zombie), but stay on screen. A session
-with nothing new to report still heartbeats — an unconditional
-`PersistPresence` on every Slow (60s) tick, bypassing the normal
-content-edge gate — so an idle-but-alive session's file rarely even crosses
-into stale. The session's own name arrives the same push-style way its
-liveness does: `Event::ModeUpdate`'s `ModeInfo.session_name`, not a
-session-list lookup.
+have Zellij resurrect it as an empty zombie), but remain remembered and
+reappear after a fresh heartbeat. A session with nothing new to report still
+emits `PersistPresence` every 60 domain ticks, bypassing the normal content-edge
+gate, so an idle-but-alive session's file rarely crosses into stale. The
+session's own name arrives the same push-style way its liveness does:
+`Event::ModeUpdate`'s `ModeInfo.session_name`, not a session-list lookup.
 
 **Badge and cycling share one order.** `Sessions::badge()` (what the rail
 shows) and `Sessions::cycle()`/`tick()` (what `session-next`/`session-prev`

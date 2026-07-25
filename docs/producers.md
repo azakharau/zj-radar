@@ -68,6 +68,26 @@ cargo install zj-radar
 Codex hooks report turn start, tool use, permission requests, subagents, and
 turn stop. zj-radar maps those to `running`, `pending`, and `done`.
 
+## Embedded remote Zellij sessions
+
+Install `zj-radar` and the normal agent hooks on both hosts. From a local
+Zellij pane, attach through the native bridge:
+
+```sh
+zj-radar remote HOST SESSION
+```
+
+The command is the SSH session: it stays in the foreground and exits when the
+embedded session exits. A private reverse Unix-socket forward carries the
+remote hook state to the outer local pane. Startup reads Zellij's structured
+all-tab pane list once so existing agent panes appear immediately; later state
+changes are push-driven. There is no Python wrapper, terminal-output watcher,
+title heuristic, polling loop, or background daemon.
+
+Remote pane ids are never broadcast into the local Zellij server. The bridge
+aggregates them under the outer pane and labels the row with `SESSION` (without
+a `remote:` prefix).
+
 ## Any script: `zj-radar notify generic`
 
 Anything that isn't an instrumented agent — deploy scripts, cron jobs,
@@ -135,9 +155,16 @@ name, never `--plugin`) a `zj_radar.status.v1` message:
   plugin clears it on idle and on return-to-shell.
 - `ack` (optional, default `false`): "the user has already seen this status" —
   the plugin converges state as usual but never fires a desktop notification
-  for it. Set by the rail's own right-click acknowledge broadcast; producers
+  for it. Set by the rail's own pending-row click broadcast; producers
   reporting real events should leave it absent (an acknowledged `done` would
   otherwise skip the completion notification the user wanted).
+- `gone` (optional, default `false`): "the agent behind this pane exited" —
+  the plugin drops the pane's row outright instead of leaving a stale
+  done/idle entry. Send `status: "idle"` alongside for graceful degradation
+  on plugins that predate the field (they fold it to a plain idle row). CLI:
+  `zj-radar notify generic --gone`. Bundled agent hooks currently end with an
+  `idle` update; `gone` is opt-in for producers that know the owning process
+  has exited. The remote bridge forwards the field unchanged.
 - Unknown fields are ignored, so it's safe to send extras. (A former `on_focus`
   clear-on-focus hint is no longer used — the plugin clears a finished status when
   the pane returns to its shell prompt instead — but sending it does no harm.)
@@ -150,7 +177,7 @@ also enforces field limits, so you don't have to pre-truncate: `repo`/`branch` a
 `msg`/`task` to 60, `source` to 16 — and a payload over **64 KB** is dropped
 whole. `pane.type` must be `"terminal"`; any other pane type is rejected.
 
-Quick smoke test (a "fake agent" — broadcast straight from your shell):
+Quick smoke test (a "fake agent" — send straight from your shell):
 
 ```sh
 zellij pipe --name zj_radar.status.v1 -- \
@@ -158,14 +185,14 @@ zellij pipe --name zj_radar.status.v1 -- \
 ```
 
 **Bound your sends.** `zellij pipe` is not fire-and-forget: Zellij holds the
-client process until *every* loaded plugin instance consumes the message
-(CLI-pipe backpressure). A plugin instance stuck at its permission prompt
-blocks the client **forever** — and a producer that fires per tool-call then
-leaks one blocked process plus two Zellij-server FDs per event, until the
-server hits EMFILE and the whole session crashes. Wrap the call in a timeout
-(the bundled producers use 5 s, `ZJ_RADAR_PIPE_TIMEOUT` to override); killing
-the client past the deadline loses nothing — the message is already queued
-server-side.
+client process until every subscribed radar instance consumes the message
+(CLI-pipe backpressure). A radar instance stuck at its own permission prompt
+can still block forever.
+A producer firing per tool call would then leak one blocked process plus two
+Zellij-server FDs per event until the server hits EMFILE. Wrap the call in a
+timeout (the bundled producers use 5 s, `ZJ_RADAR_PIPE_TIMEOUT` to override);
+killing the client past the deadline loses nothing — the message is already
+queued server-side.
 
 The timeout must survive **your own death**, too. Hook runners kill their
 hooks, and a producer killed mid-send never runs its kill-on-deadline — the

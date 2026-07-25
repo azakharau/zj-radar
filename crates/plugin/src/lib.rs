@@ -242,17 +242,6 @@ impl State {
                     Some(pos) => switch_session_with_focus(&name, Some(pos), None),
                     None => switch_session(Some(&name)),
                 },
-                Effect::DismissPresence { name } => {
-                    // The predicate parses each candidate file the same way
-                    // the read path does (`Presence::parse`), so a dismiss
-                    // matches names exactly as leniently as the badge that
-                    // showed them — while `remove_presences_matching` itself
-                    // stays parse-agnostic (see its doc for the layering).
-                    self.session_files.remove_presences_matching(|json| {
-                        crate::presence::Presence::parse(json)
-                            .is_some_and(|p| p.session_name == name)
-                    });
-                }
                 Effect::BroadcastStatus { payload } => {
                     // Same delivery every CLI producer already uses
                     // (`crates/cli/src/notify.rs`'s `broadcast`): `zellij
@@ -281,12 +270,18 @@ impl State {
                     // on a wedged receiver (e.g. stuck at a permission
                     // prompt), closing the orphaned-process leak this arm
                     // previously documented as an accepted risk.
-                    let argv = crate::pipe::self_limiting_pipe_argv(
+                    let argv = crate::pipe::self_limiting_pipe_argv_for_session(
                         &payload,
                         crate::pipe::DEFAULT_PIPE_TIMEOUT_SECS,
+                        self.runtime.own_session_name(),
                     );
                     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    run_command(&args, std::collections::BTreeMap::new());
+                    run_command_with_env_variables_and_cwd(
+                        &args,
+                        BTreeMap::new(),
+                        std::path::PathBuf::from("."),
+                        BTreeMap::new(),
+                    );
                 }
             }
         }
@@ -395,6 +390,7 @@ impl ZellijPlugin for State {
                             default_fg: p.default_fg,
                             exited: p.exited,
                             exit_status: p.exit_status,
+                            terminal_command: p.terminal_command,
                         })
                     })
                     .collect();
@@ -410,13 +406,10 @@ impl ZellijPlugin for State {
                 // the state settles (request in-flight or resolved) the runtime
                 // ignores the probe, so skip the disk reads: with one instance
                 // per tab, probing forever is N marker reads per second.
-                // Upstream documents `elapsed_s` only as the timer-expiry
-                // payload: elapsed seconds since the `set_timeout` call, which
-                // for a fired one-shot is ~= the duration it was armed with —
-                // not a guaranteed-exact echo of it. That's all the runtime
-                // needs: its 5s stale-fire threshold discriminates a ~1s (Fast)
-                // arm from a ~60s (Slow) one with wide margin either way, so
-                // scheduler jitter can't flip the classification.
+                // Upstream reports actual elapsed time, which can be much
+                // larger than the requested delay under load. The runtime
+                // deliberately ignores it for timer identity and uses the
+                // cadence stored with its sole outstanding timeout instead.
                 let probe = if self.runtime.wants_permission_probe() {
                     self.session_files.refresh_permission_probe()
                 } else {
@@ -429,8 +422,12 @@ impl ZellijPlugin for State {
                 let outcome = self.runtime.mouse_click(line);
                 self.handle_outcome(outcome)
             }
-            Event::Mouse(Mouse::RightClick(line, _col)) => {
-                let outcome = self.runtime.mouse_right_click(line);
+            Event::Mouse(Mouse::ScrollUp(n)) => {
+                let outcome = self.runtime.scroll_agents_up(n);
+                self.handle_outcome(outcome)
+            }
+            Event::Mouse(Mouse::ScrollDown(n)) => {
+                let outcome = self.runtime.scroll_agents_down(n);
                 self.handle_outcome(outcome)
             }
             Event::PermissionRequestResult(status) => {
@@ -487,19 +484,23 @@ mod tests {
     use crate::status::Status;
     use crate::test_fixtures::{pane, payload_for, tab};
 
-    /// The bash fallback producer can't import `payload::STATUS_PIPE_NAME`, so
-    /// its hand-typed literal is pinned here — one drifted character in a pipe
-    /// name is a silently dead producer, the least debuggable failure this
-    /// system has. (This crate isn't published to crates.io, so reaching
-    /// outside the crate dir is safe — same pattern as `reference_tests.rs`.)
+    /// The bash fallback producer can't import the pipe-name constant, so pin
+    /// the shared name here. Deliberately NO `--plugin` targeting: a
+    /// `--plugin` pipe LAUNCHES the plugin when Zellij considers it "not
+    /// running" (identity includes the caller's cwd), spawning rogue floating
+    /// rail instances that silently swallow every status.
     #[test]
-    fn bash_producer_broadcasts_on_the_shared_pipe_name() {
+    fn bash_producer_targets_every_radar_instance_on_the_shared_pipe() {
         let sh = include_str!("../../../plugins/zj-radar-claude/scripts/notify.sh");
-        let broadcast = format!("zellij pipe --name {} --", payload::STATUS_PIPE_NAME);
+        let command = format!("zellij pipe --name {} --", payload::STATUS_PIPE_NAME);
         assert!(
-            sh.contains(&broadcast),
-            "notify.sh must broadcast via `{broadcast}`; if the pipe name is \
-             versioned, bump payload::STATUS_PIPE_NAME and notify.sh together"
+            sh.contains(&command),
+            "notify.sh must send via `{command}`; keep the pipe name aligned \
+             with the Rust producer"
+        );
+        assert!(
+            !sh.contains("--plugin"),
+            "notify.sh must not target --plugin (rogue-launch footgun)"
         );
     }
 

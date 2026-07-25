@@ -116,11 +116,18 @@ pub struct StatusPayload {
     /// `Other`). Optional; sanitized and capped at [`MAX_SOURCE_CHARS`].
     pub source: String,
     /// The user has already seen this status: converge state as usual, but the
-    /// notifier must stay silent for it. Set by the rail's right-click
-    /// acknowledge (whose whole point is "stop flagging this" — its synthetic
+    /// notifier must stay silent for it. Set by the rail's pending-row
+    /// acknowledgement (whose whole point is "stop flagging this" — its synthetic
     /// `done` echo must not itself pop a notification); producers reporting
     /// real events leave it absent. Optional; absent on the wire when `false`.
     pub ack: bool,
+    /// The producer says the agent behind this pane is gone (process exited,
+    /// remote agent closed): the plugin drops the pane's observation outright
+    /// — the row vanishes instead of lingering as a stale done/idle entry.
+    /// `status` is ignored when set (send `idle` for old-plugin degradation:
+    /// an old plugin folds the payload to a plain idle row). Optional; absent
+    /// on the wire when `false`.
+    pub gone: bool,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +156,8 @@ struct Raw {
     source: String,
     #[serde(default)]
     ack: bool,
+    #[serde(default)]
+    gone: bool,
 }
 // Note: the retired clear-on-focus hint key is silently ignored (serde drops
 // unknown fields) — no longer consumed, kept tolerated on the wire for back-compat
@@ -314,6 +323,7 @@ pub fn parse(raw: &str) -> Option<StatusPayload> {
         task: sanitize(&r.task, MAX_TASK_CHARS),
         source: sanitize(&r.source, MAX_SOURCE_CHARS),
         ack: r.ack,
+        gone: r.gone,
     })
 }
 
@@ -334,6 +344,8 @@ struct Wire<'a> {
     // event) — so the pinned wire bytes and existing consumers see no change.
     #[serde(skip_serializing_if = "is_false")]
     ack: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    gone: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -383,6 +395,7 @@ pub fn to_wire(p: &StatusPayload) -> String {
         msg: cap_chars(&p.msg, MAX_WIRE_FIELD_CHARS),
         task: cap_chars(&p.task, MAX_WIRE_FIELD_CHARS),
         ack: p.ack,
+        gone: p.gone,
     })
     .expect("status payload of plain fields always serializes")
 }
@@ -610,6 +623,7 @@ mod tests {
             task: "fix flaky e2e".into(),
             source: "claude".into(),
             ack: false,
+            gone: false,
         });
         let got = parse(&json).expect("to_wire output must parse");
         assert_eq!(got.task, "fix flaky e2e");
@@ -639,6 +653,7 @@ mod tests {
             task: "".into(),
             source: "claude".into(),
             ack: false,
+            gone: false,
         });
         let got = parse(&json).expect("to_wire output must parse");
         assert_eq!(got.pane_id, 12);
@@ -665,6 +680,7 @@ mod tests {
             task: "fix flaky e2e".into(),
             source: "claude".into(),
             ack: false,
+            gone: false,
         });
         assert_eq!(
             json,
@@ -677,11 +693,33 @@ mod tests {
         // False (every real producer event) emits no key at all — the pinned
         // bytes above prove existing payloads are unchanged. True rides the
         // wire and survives parse; absent defaults false (old producers).
-        let acked = to_wire(&StatusPayload { pane_id: 3, status: Status::Done, ack: true, ..Default::default() });
+        let acked = to_wire(&StatusPayload {
+            pane_id: 3,
+            status: Status::Done,
+            ack: true,
+            gone: false,
+            ..Default::default()
+        });
         assert!(acked.ends_with(r#""ack":true}"#), "ack rides the wire when set: {acked}");
         assert!(parse(&acked).unwrap().ack);
         let got = p(r#"{"pane":{"type":"terminal","id":3},"status":"done"}"#).unwrap();
         assert!(!got.ack, "absent ack defaults false");
+    }
+    #[test]
+    fn gone_is_absent_on_the_wire_unless_true_and_round_trips() {
+        let gone = to_wire(&StatusPayload {
+            pane_id: 3,
+            status: Status::Idle,
+            gone: true,
+            ..Default::default()
+        });
+        assert!(
+            gone.ends_with(r#""gone":true}"#),
+            "gone rides the wire when set: {gone}"
+        );
+        assert!(parse(&gone).unwrap().gone);
+        let got = p(r#"{"pane":{"type":"terminal","id":3},"status":"done"}"#).unwrap();
+        assert!(!got.gone, "absent gone defaults false");
     }
 
     #[test]
@@ -737,7 +775,7 @@ mod tests {
             // silently dropped). Only printable ASCII within each field's cap is
             // generated, so sanitize does not alter any field and whole-struct
             // equality is the exact inverse law.
-            let p = StatusPayload { pane_id: pane, status, repo, branch, msg, task, source, ack };
+            let p = StatusPayload { pane_id: pane, status, repo, branch, msg, task, source, ack, gone: false };
             let got = parse(&to_wire(&p)).expect("our own wire output must parse");
             prop_assert_eq!(got, p);
         }

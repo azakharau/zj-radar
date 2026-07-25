@@ -366,9 +366,10 @@ const LAYOUT: &str = include_str!("run_assets/radar.kdl");
 const ONBOARDING_LAYOUT: &str = include_str!("run_assets/radar-onboarding.kdl");
 
 // build.rs sets `embedded_wasm` (+ ZJ_RADAR_WASM_PATH) when it has a wasm to
-// bake in — true for every prebuilt binary (curl|sh, binstall, nix) and any
-// in-workspace build. A from-crates.io `cargo install` has no wasm to embed, so
-// WASM is None and `run` downloads the matching release on first use.
+// bake in — true for every prebuilt binary (curl|sh, binstall, nix) and a local
+// build made after the wasm artifact. A from-crates.io `cargo install` has no
+// wasm to embed, so WASM is None and `run` downloads the matching release on
+// first use.
 #[cfg(embedded_wasm)]
 const WASM: Option<&[u8]> = Some(include_bytes!(env!("ZJ_RADAR_WASM_PATH")));
 #[cfg(not(embedded_wasm))]

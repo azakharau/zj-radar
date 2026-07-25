@@ -6,6 +6,7 @@ fn pane(id: u32, title: &str) -> TerminalPane {
         id,
         title: title.to_string(),
         focused_in_tab: false,
+        push_owned: false,
     }
 }
 
@@ -63,6 +64,32 @@ fn untracked_panes_are_shown_but_not_counted() {
     assert_eq!(display.panes[0].pane_id(), 1);
     assert_eq!(display.panes[1].pane_id(), 2);
     assert!(!display.panes[1].is_tracked());
+}
+#[test]
+fn empty_task_falls_back_to_omp_pane_title() {
+    // Resumed omp sessions never surface their name through the extension
+    // API, but omp maintains the pane title as `π: <session name>` — the
+    // rollup adopts it as the sticky task label. A producer-sent task wins;
+    // non-π titles contribute nothing (render falls back to the tab name).
+    let mut map = HashMap::new();
+    let mut o = obs(ObservationOrigin::StatusPipe, Status::Running, 1);
+    o.kind = Kind::Omp;
+    map.insert(1, o.clone());
+    let mut named = o.clone();
+    named.task = "producer label".into();
+    map.insert(2, named);
+    map.insert(3, o);
+
+    let panes = [
+        pane(1, "π: fix parser"),
+        pane(2, "π: ignored - producer wins"),
+        pane(3, "plain shell title"),
+    ];
+    let display = roll_up(&panes, resolver(&map));
+
+    assert_eq!(display.panes[0].task(), "fix parser");
+    assert_eq!(display.panes[1].task(), "producer label");
+    assert_eq!(display.panes[2].task(), "");
 }
 
 #[test]
@@ -133,6 +160,103 @@ fn pending_is_only_counted_for_tracked_panes() {
         display.progress.pending, 0,
         "pending must not count a pane excluded from total"
     );
+    assert!(!display.panes[0].is_tracked());
+}
+
+#[test]
+fn never_active_status_pipe_agent_is_tracked_without_progress() {
+    let mut map = HashMap::new();
+    let mut announced = obs(ObservationOrigin::StatusPipe, Status::Idle, 1);
+    announced.kind = Kind::Claude;
+    announced.ever_active = false;
+    map.insert(1, announced);
+
+    let display = roll_up(&[pane(1, "shell")], resolver(&map));
+
+    assert!(display.panes[0].is_tracked());
+    assert!(display.panes[0].is_agent());
+    assert_eq!(display.status, Status::Idle);
+    assert_eq!(display.progress, ProgressCounts::default());
+}
+#[test]
+fn never_active_status_pipe_generic_source_is_tracked_as_an_agent() {
+    // An explicitly announced `generic` source maps to Kind::Other. The
+    // producer vouched for the pane, so the agents-only rail must show it.
+    let mut map = HashMap::new();
+    let mut announced = obs(ObservationOrigin::StatusPipe, Status::Idle, 1);
+    announced.kind = Kind::Other;
+    announced.ever_active = false;
+    map.insert(1, announced);
+
+    let display = roll_up(&[pane(1, "shell")], resolver(&map));
+
+    assert!(display.panes[0].is_tracked());
+    assert!(display.panes[0].is_agent());
+}
+
+#[test]
+fn command_origin_other_kind_is_never_an_agent() {
+    // The command heuristic can produce ever_active rows with non-agent
+    // kinds; those are tasks, not announced agents — the agents-only rail
+    // must not show them.
+    let mut map = HashMap::new();
+    let mut o = obs(ObservationOrigin::Command, Status::Running, 1);
+    o.kind = Kind::Other;
+    map.insert(1, o);
+
+    let display = roll_up(&[pane(1, "make")], resolver(&map));
+
+    assert!(
+        display.panes[0].is_tracked(),
+        "ever_active rows stay tracked"
+    );
+    assert!(
+        !display.panes[0].is_agent(),
+        "a command-heuristic Other row must stay off the agents rail"
+    );
+}
+#[test]
+fn idle_after_work_stays_on_the_agents_rail() {
+    // An agent that finished its work and sits idle at the prompt is still
+    // an OPEN agent — the rail's contract is "every open agent, with
+    // status". Rows leave only via `gone` or the pane closing.
+    let mut map = HashMap::new();
+    let mut o = obs(ObservationOrigin::StatusPipe, Status::Idle, 1);
+    o.kind = Kind::Claude;
+    o.ever_active = true;
+    map.insert(1, o);
+
+    let display = roll_up(&[pane(1, "shell")], resolver(&map));
+
+    assert!(display.panes[0].is_tracked(), "tree mode still shows it");
+    assert!(
+        display.panes[0].is_agent(),
+        "an idle agent that has worked stays on the agents rail"
+    );
+}
+
+#[test]
+fn never_active_status_pipe_task_is_untracked() {
+    let mut map = HashMap::new();
+    let mut announced = obs(ObservationOrigin::StatusPipe, Status::Idle, 1);
+    announced.ever_active = false;
+    map.insert(1, announced);
+
+    let display = roll_up(&[pane(1, "shell")], resolver(&map));
+
+    assert!(!display.panes[0].is_tracked());
+}
+
+#[test]
+fn never_active_command_agent_is_untracked() {
+    let mut map = HashMap::new();
+    let mut observed = obs(ObservationOrigin::Command, Status::Idle, 1);
+    observed.kind = Kind::Claude;
+    observed.ever_active = false;
+    map.insert(1, observed);
+
+    let display = roll_up(&[pane(1, "shell")], resolver(&map));
+
     assert!(!display.panes[0].is_tracked());
 }
 

@@ -338,7 +338,7 @@ fn multi_pane_renders_one_line_per_pane() {
 /// After piping a running agent to the focused pane, the parsed sidebar must show:
 ///   1. the " RADAR" header on row 0;
 ///   2. the agent card as TWO rows — a tab row carrying the focus spine `▌` and a
-///      running spinner glyph (one of `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), and the next row carrying the
+///      running spinner glyph (a frame of the 3×4 dot-ring snake, e.g. `⠉⠃`), and the next row carrying the
 ///      activity (`building`) and the Claude identity mark `✳` — proving the
 ///      two-line agent card layout survived the full plugin → Zellij → PTY
 ///      round-trip;
@@ -408,9 +408,9 @@ fn rendered_sidebar_paints_focused_card_with_text_and_tint() {
         tab_row.contains('▌'),
         "the focused agent's tab row must carry the focus spine '▌'; got {tab_row:?}\nsidebar:\n{sidebar}"
     );
-    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    const SPINNER: [&str; 10] = ["⠉⠃", "⠈⠇", "⠀⡇", "⢀⡆", "⣀⡄", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁"];
     assert!(
-        tab_row.chars().any(|c| SPINNER.contains(&c)),
+        SPINNER.iter().any(|s| tab_row.contains(s)),
         "the running agent's tab row must carry a spinner glyph (one of {SPINNER:?}); got {tab_row:?}\nsidebar:\n{sidebar}"
     );
 
@@ -663,6 +663,49 @@ fn click_on_a_tab_row_switches_the_active_tab() {
     );
 
     eprintln!("[e2e] PASS: a real rail click switched the active tab end-to-end");
+}
+
+#[test]
+#[ignore = "e2e: requires zellij + built wasm; run via `just test-e2e`"]
+fn left_click_on_a_pending_row_navigates_and_acknowledges_it() {
+    let wasm = plugin_wasm_path();
+    assert!(
+        wasm.exists(),
+        "Plugin wasm not found at {:?}. Build it first:\n  cargo build --release --target wasm32-wasip1",
+        wasm
+    );
+
+    let temp_home = pre_grant_permissions(&wasm);
+    let session_name = format!("zjr_left_click_ack_{}", std::process::id());
+    let layout = sidebar_layout(&wasm);
+    let session = ZellijSession::start(&session_name, &layout, &wasm, temp_home);
+    let pane_id = session.discover_terminal_pane_id();
+    let pending = format!(
+        r#"{{"v":1,"source":"claude","pane":{{"type":"terminal","id":{pane_id}}},"status":"pending","msg":"needs you"}}"#
+    );
+    session.pipe_status(&pending);
+
+    // Status echoes ("needs you") are no longer rendered — the glyph carries
+    // the state, so the row reads `◆ ✳ claude · <tab>` while pending and
+    // flips to `●` on acknowledge.
+    let ready = session.wait_until(std::time::Duration::from_secs(6), |s| {
+        sidebar_region(&s.screen(), 32).contains("◆")
+    });
+    assert!(ready, "pending row did not render before click");
+
+    let screen = session.screen();
+    let row =
+        sidebar_row_index(&screen, 32, "◆").expect("pending row must be locatable in the rail");
+    let acknowledged = session.wait_until(std::time::Duration::from_secs(8), |s| {
+        s.click_at(3, (row + 1) as u16);
+        let sidebar = sidebar_region(&s.screen(), 32);
+        sidebar.contains("●") && !sidebar.contains("◆")
+    });
+    assert!(
+        acknowledged,
+        "left-click must navigate to and acknowledge the pending row;\nsidebar:\n{}",
+        sidebar_region(&session.screen(), 32)
+    );
 }
 
 /// Pins the load-bearing property behind the exit-clear fix: per-pane
@@ -967,14 +1010,14 @@ fn rail_paints_every_column_of_its_pane() {
     // painted further right than expected).
     eprintln!(
         "[e2e] columns 28..40 header:  {:?}",
-        &header_dump[28..40]
+        header_dump[28..40]
             .iter()
             .map(|(c, bg, ch)| format!("{c}:{bg:?}:{ch:?}"))
             .collect::<Vec<_>>()
     );
     eprintln!(
         "[e2e] columns 28..40 card:    {:?}",
-        &card_dump[28..40]
+        card_dump[28..40]
             .iter()
             .map(|(c, bg, ch)| format!("{c}:{bg:?}:{ch:?}"))
             .collect::<Vec<_>>()
@@ -1074,21 +1117,8 @@ fn session_next_switches_to_the_session_with_attention() {
     );
     b.pipe_status(&b_payload);
 
-    // `Effect::ReadPresences` (A reading the shared /cache root back) is
-    // gated to Fast timer fires only (runtime.rs `timer`), and A has nothing
-    // of its own yet to arm Fast — it would otherwise idle on the 60s Slow
-    // heartbeat and this test would need up to a minute of real wall time to
-    // stay honest. Piping a `running` status into A's OWN terminal arms A's
-    // Fast cadence indefinitely (an active `Running` row animates every
-    // tick — see `timer_should_continue`/`has_running_work`) without giving A
-    // any attention of its own, so it doesn't interfere with the ordering
-    // assertion below (B is still the only attention>0 peer).
-    let pane_a = a.discover_terminal_pane_id();
-    eprintln!("[e2e] A terminal pane_id={pane_a}");
-    let a_payload = format!(
-        r#"{{"v":1,"source":"claude","pane":{{"type":"terminal","id":{pane_a}}},"status":"running","repo":"radar-a-repo","msg":"keep-fast"}}"#
-    );
-    a.pipe_status(&a_payload);
+    // A's named quiet rail reads the shared /cache root on its 1 Hz Idle
+    // callback, so B must appear without synthetic activity in A.
 
     // A's badge must show B's name TOGETHER WITH the attention glyph+count —
     // not just B's bare name. Under the new design, B's presence entry is
@@ -1106,11 +1136,8 @@ fn session_next_switches_to_the_session_with_attention() {
         saw_badge,
         "A's badge never showed {needle:?}. Either B never learned its own session name from \
          `Event::ModeUpdate` (so `project` withheld `Effect::PersistPresence`), or B's presence \
-         file (written under the shared /cache root) never reached A (A's `Effect::ReadPresences` \
-         is Fast-tick-gated — see the rail above for whether A even looks fast-armed). Since \
-         task-14, a stale peer still renders (dimmed) rather than being dropped, so a bare \
-         name with the wrong (or missing) counts, not an absent line, is the sign of a genuine \
-         presence-plumbing failure here. See the printed rail above.",
+         file (written under the shared /cache root) never reached A on its Idle presence read. \
+         See the printed rail above.",
     );
     eprintln!("[e2e] PASS: A's badge shows B needing attention (presence crossed /cache)");
 
@@ -1118,9 +1145,8 @@ fn session_next_switches_to_the_session_with_attention() {
     // then attention>0 peers by name, then the rest — B is the only
     // attention>0 peer, so a single `session-next` tap selects it outright.
     // The actual switch is a LATER idle-commit (`timer`'s `Sessions::tick`),
-    // firing on the very next Fast tick after the tap (~1s here, since A's
-    // `running` row above keeps Fast armed) — not an immediate effect of the
-    // pipe call itself.
+    // firing after the tap-covering callback and the next quiet Fast callback,
+    // not as an immediate effect of the pipe call itself.
     a.run_action(&["pipe", "--name", "zj_radar.cmd.v1", "--", "session-next"]);
 
     // After the idle-commit fires, `Effect::SwitchSession` calls Zellij's

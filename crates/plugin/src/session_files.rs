@@ -35,15 +35,10 @@ const NOTIFY_CLAIM_TTL: Duration = Duration::from_secs(30);
 const NOTIFY_CLAIM_SWEEP_AGE: Duration = Duration::from_secs(300);
 const PERMISSION_GRANTED_MARKER: &str = "granted";
 const PERMISSION_DENIED_MARKER: &str = "denied";
-/// Horizon after which a presence file is deleted as debris at `open` time —
-/// the ONLY true forgetting a peer's roster entry is subject to (task-14,
-/// user decision: a remembered session must never silently vanish from the
-/// badge). Peers dead well before their file turns 6h old still keep
-/// showing up in every other session's badge, dimmed as stale
-/// (`sessions::STALE_AFTER_SECS`) rather than dropped — this sweep only
-/// exists so a long string of genuinely dead sessions' files don't
-/// accumulate forever in the shared root. Generous: a detached-but-alive
-/// session whose timer idles must not be reaped.
+/// Horizon after which an unrefreshed presence file is deleted as debris at
+/// `open` time. Badge liveness uses the much shorter `STALE_AFTER_SECS` grace;
+/// this conservative sweep only prevents old pid-keyed files accumulating
+/// forever without risking a detached-but-alive session's data.
 const PRESENCE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 /// Deliberately distinct from the pid-scoped `session_prefix` (`zj-radar.<pid>`) so
 /// `is_owned_session_file` / `is_current_session_file` and the snapshot sweep
@@ -254,43 +249,6 @@ impl SessionFiles {
         }
         out.sort_by(|a, b| a.json.cmp(&b.json));
         out
-    }
-
-    /// Delete every presence file in the shared root whose raw JSON content
-    /// satisfies `matches` — the on-disk half of a manual dismiss
-    /// (`Effect::DismissPresence`), and the only forgetting besides the
-    /// open-time `PRESENCE_MAX_AGE` sweep. Same file recognizer as
-    /// `read_peer_presences` (prefix + `.json`, so tmp files and snapshots
-    /// never match), but deliberately no own-file exclusion: this is
-    /// content-driven, not identity-driven, and the runtime only ever calls
-    /// it for a name it has confirmed stale — the own entry is never stale
-    /// (`sessions::Sessions::dismiss`). Every match is deleted, not just the
-    /// freshest: a name can have multiple pid-keyed corpses on disk (see
-    /// `update_presences`'s dedup doc in `sessions.rs`). Parse-agnostic on
-    /// purpose — the predicate receives raw file content, and the caller
-    /// (lib.rs's effect handler) supplies a `Presence::parse`-based closure,
-    /// so name matching stays exactly as lenient as every other presence
-    /// read path without this module learning about `Presence` at all.
-    /// A no-op in disabled mode (no writable root).
-    pub(crate) fn remove_presences_matching(&self, matches: impl Fn(&str) -> bool) {
-        let Some(paths) = &self.paths else {
-            return;
-        };
-        let Ok(entries) = std::fs::read_dir(&paths.root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with(PRESENCE_PREFIX) || !name.ends_with(".json") {
-                continue; // tmp files and snapshots don't match
-            }
-            if let Ok(json) = std::fs::read_to_string(entry.path()) {
-                if matches(&json) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
     }
 
     /// Re-probe the permission state for a timer tick: re-read the marker and,
@@ -1086,48 +1044,5 @@ mod tests {
             SNAPSHOT_MAX_AGE,
         );
         assert!(s.files.read_peer_presences().is_empty());
-    }
-
-    #[test]
-    fn remove_presences_matching_deletes_every_file_satisfying_the_predicate_and_spares_others() {
-        let dir = tempfile::tempdir().unwrap();
-        let reader = SessionFiles::open_with_roots_at(
-            SessionFileIds { plugin_id: 1, zellij_pid: 100 },
-            [dir.path().to_path_buf()],
-            SystemTime::now(),
-            SNAPSHOT_MAX_AGE,
-        );
-        let alpha_a = SessionFiles::open_with_roots_at(
-            SessionFileIds { plugin_id: 2, zellij_pid: 200 },
-            [dir.path().to_path_buf()],
-            SystemTime::now(),
-            SNAPSHOT_MAX_AGE,
-        );
-        let alpha_b = SessionFiles::open_with_roots_at(
-            SessionFileIds { plugin_id: 3, zellij_pid: 300 },
-            [dir.path().to_path_buf()],
-            SystemTime::now(),
-            SNAPSHOT_MAX_AGE,
-        );
-        let beta = SessionFiles::open_with_roots_at(
-            SessionFileIds { plugin_id: 4, zellij_pid: 400 },
-            [dir.path().to_path_buf()],
-            SystemTime::now(),
-            SNAPSHOT_MAX_AGE,
-        );
-        alpha_a.files.persist_presence(r#"{"session_name":"alpha","running":1,"attention":0}"#);
-        alpha_b.files.persist_presence(r#"{"session_name":"alpha","running":2,"attention":0}"#);
-        beta.files.persist_presence(r#"{"session_name":"beta","running":1,"attention":0}"#);
-
-        reader.files.remove_presences_matching(|json| json.contains(r#""alpha""#));
-
-        assert!(!dir.path().join("zj-radar.presence.200.json").exists());
-        assert!(!dir.path().join("zj-radar.presence.300.json").exists());
-        assert!(dir.path().join("zj-radar.presence.400.json").exists());
-    }
-
-    #[test]
-    fn remove_presences_matching_is_a_noop_in_disabled_mode() {
-        SessionFiles::default().remove_presences_matching(|_| true);
     }
 }

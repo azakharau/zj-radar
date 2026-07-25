@@ -5,36 +5,28 @@
 //! rows-derived-on-render doctrine (`CONTEXT.md`) rather than caching a
 //! badge that could drift from `peers`/`own`.
 //!
-//! task-14 (user decision): a remembered session must NEVER silently vanish
-//! from the badge. `session_files::read_peer_presences` no longer filters
-//! anything by mtime — every peer file it finds comes back, forever (until
-//! the 6h open-time sweep, the only true forgetting). Liveness is instead a
-//! per-entry *staleness* state this module derives from the mtime age it's
-//! handed: `fresh` while recently heartbeated, `stale` past
-//! [`STALE_AFTER_SECS`] — dimmed on the badge and unreachable via `cycle()`,
-//! but never dropped. This module's other leniency is limited to "don't
-//! choke on a malformed line" (`Presence::parse`), not "cross-check
-//! membership".
+//! Remembered peers stay in memory while their presence files exist, but only
+//! recently-heartbeated sessions belong in the badge. A peer is `fresh` until
+//! [`STALE_AFTER_SECS`] and hidden after that grace period; a later heartbeat
+//! makes it visible again without reconstructing any state. The backing files
+//! remain subject to `session_files`' conservative 6h debris sweep, so a missed
+//! heartbeat never destroys another live session's data.
 //!
 //! Ordering is a single source of truth shared by `badge()` (what's shown)
 //! and `cycle()` (what Alt+[/] steps through): current session first, then
 //! fresh `attention > 0` sessions by name, then the rest of the fresh
-//! sessions by name, then every stale session by name — stale entries never
-//! jump the queue on attention, since a likely-dead session's last-known
-//! attention count isn't actionable.
+//! sessions by name. Stale peers are neither shown nor selectable.
 
 use std::collections::HashMap;
 
 use crate::presence::Presence;
 use crate::radar_state::Direction;
 
-/// How long a peer's presence file may sit unrefreshed before its badge row
-/// dims to stale. `runtime.rs`'s timer heartbeats an idle-but-alive
-/// session's own file at least once per Slow (60s) tick, so 90s gives 50%
-/// margin against a single missed beat before flagging it — generous
-/// enough that ordinary scheduler jitter never flickers an entry, but a
-/// session that's genuinely gone quiet reads as such promptly. A missed
-/// beat marks stale, never vanishes (see the module doc).
+/// How long a peer's presence file may sit unrefreshed before the session is
+/// hidden. `runtime.rs` heartbeats an idle-but-alive session's own file every
+/// 60 domain ticks (normally 60s), so 90s leaves margin against a missed beat
+/// without leaving a deleted session visible indefinitely. The peer
+/// remains in memory and reappears on its next fresh heartbeat.
 pub(crate) const STALE_AFTER_SECS: u64 = 90;
 
 /// A peer's [`Presence`] plus the staleness derived from its presence
@@ -47,17 +39,11 @@ struct Peer {
     stale: bool,
 }
 
-/// A row in the shared ordering: a [`Presence`] (own or peer) plus whether
-/// it's the current session and whether it's stale. `own` contributes at
-/// most one of these (via `set_own`, always fresh — this session knows its
-/// own liveness directly); every peer in `peers` contributes one. Combines
-/// what used to be a separate `SessionLite` (identity) + a `presence_for`
-/// lookup (counts) into a single reference, now that a `Presence` IS the
-/// identity (its `session_name`) as well as the counts.
+/// A fresh row in the shared ordering: a [`Presence`] (own or peer) plus
+/// whether it's the current session. Stale peers never enter this type.
 struct OrderedEntry<'a> {
     presence: &'a Presence,
     is_current: bool,
-    stale: bool,
 }
 
 /// One row of the cross-session badge, in display order.
@@ -69,7 +55,6 @@ pub(crate) struct BadgeEntry {
     pub attention_tab_position: Option<usize>,
     pub is_current: bool,
     pub selected: bool,
-    pub stale: bool,
 }
 
 /// Where a committed cycle gesture lands — enough for the runtime to switch
@@ -160,28 +145,6 @@ impl Sessions {
         self.badge() != before
     }
 
-    /// Manually forget a peer by name — the in-memory half of the right-click
-    /// dismiss gesture (`PluginRuntime::mouse_right_click`), the user-driven
-    /// complement to the 6h open-time sweep for a session the user already
-    /// knows is dead. Removing the entry here gives instant visual feedback
-    /// (the badge row vanishes on this instance without waiting for the next
-    /// file read); the on-disk half is `Effect::DismissPresence`. Only
-    /// shrinks `peers` — ordering, dedup, and cycle semantics of the
-    /// survivors are untouched, and `own` is never touched (the caller gates
-    /// on staleness, and the own entry is never stale). Safe against a
-    /// misjudged dismiss by construction: if the session is secretly still
-    /// alive, its next heartbeat/edge re-publishes a presence file and the
-    /// next `update_presences` simply brings it back, fresh — dismiss is
-    /// never destructive to a live session
-    /// (`dismissed_but_alive_session_reappears_fresh_on_next_presence_write`).
-    /// Returns whether the derived badge actually changed, same contract as
-    /// the other mutators here.
-    pub(crate) fn dismiss(&mut self, name: &str) -> bool {
-        let before = self.badge();
-        self.peers.retain(|p| p.presence.session_name != name);
-        self.badge() != before
-    }
-
     /// Advance (or start) the cycle selection and arm its tap-since-fire
     /// flag (see `SelectionState`'s doc). Re-derives the shared ordering
     /// fresh each call, so a selection started before a
@@ -190,15 +153,12 @@ impl Sessions {
     /// *name* is re-resolved against that fresh order (not trusted as a
     /// stale index) before advancing from it.
     ///
-    /// Stale entries are excluded from the cycle target set entirely — every
-    /// index/position below is computed against `selectable` (fresh entries
-    /// only), never the full `order`. Alt+[/] must never land on a
-    /// likely-dead session: `switch_session`ing onto one that's actually
-    /// gone would have Zellij resurrect it as an empty zombie (task-14).
+    /// `ordered()` has already omitted stale peers, so the indices below are
+    /// both the visible badge order and the complete selectable set.
     pub(crate) fn cycle(&mut self, dir: Direction) -> bool {
         let before = self.badge();
         let order = self.ordered();
-        let selectable: Vec<&OrderedEntry> = order.iter().filter(|s| !s.stale).collect();
+        let selectable = &order;
         // A previously selected name that no longer appears among the fresh
         // entries (its session closed, or went stale itself) is treated the
         // same as "nothing selected" — restart below rather than advance
@@ -236,14 +196,10 @@ impl Sessions {
     /// fire may commit. The selected *name* is re-resolved against a
     /// freshly derived order rather than a remembered index, so a reorder
     /// between the tap and this tick can never retarget a different
-    /// session; if the name is no longer live, the selection is dropped and
-    /// nothing commits. Landing on the current session is the cancel
-    /// gesture (`None`, no effect); a selection that went stale while
-    /// pending (its heartbeat lapsed between the tap and this fire) is
-    /// dropped the same way — `cycle()` never selects a stale entry, so one
-    /// showing up stale here can only mean it lapsed mid-flight, exactly the
-    /// likely-dead session a commit must not switch onto. Either way a
-    /// commit (or drop) clears the pending selection.
+    /// session; if the name vanished from the fresh order (including going
+    /// stale), the selection is dropped. Landing on the current session is
+    /// the cancel gesture (`None`, no effect). Either way a commit (or drop)
+    /// clears the pending selection.
     pub(crate) fn tick(&mut self) -> Option<CommitTarget> {
         let sel = self.selection.as_mut()?;
         if sel.taps_since_last_fire {
@@ -251,11 +207,11 @@ impl Sessions {
             return None;
         }
         let name = sel.name.clone();
-        self.selection = None; // committing, cancelling, or dropping a vanished/staled selection all clear
+        self.selection = None; // committing, cancelling, or dropping a vanished selection all clear
         let order = self.ordered();
         let entry = order.iter().find(|s| s.presence.session_name == name)?; // vanished session: nothing to commit
-        if entry.is_current || entry.stale {
-            return None; // cancel gesture, or the selection lapsed into staleness before commit
+        if entry.is_current {
+            return None; // cancel gesture
         }
         Some(CommitTarget {
             name: entry.presence.session_name.clone(),
@@ -264,9 +220,9 @@ impl Sessions {
     }
 
     /// The ordered badge: current session first, then fresh attention>0
-    /// sessions by name, then the rest of the fresh sessions by name, then
-    /// every stale session by name. Derived fresh from `peers`/`own` every
-    /// call — never cached — so it can never drift from its inputs.
+    /// sessions by name, then the rest of the fresh sessions by name. Stale
+    /// peers are hidden. Derived fresh from `peers`/`own` every call — never
+    /// cached — so it can never drift from its inputs.
     pub(crate) fn badge(&self) -> Vec<BadgeEntry> {
         let order = self.ordered();
         let selected_name = self.selection.as_ref().map(|sel| sel.name.as_str());
@@ -279,14 +235,13 @@ impl Sessions {
                 attention_tab_position: s.presence.attention_tab_position,
                 is_current: s.is_current,
                 selected: selected_name == Some(s.presence.session_name.as_str()),
-                stale: s.stale,
             })
             .collect()
     }
 
-    /// Whether a cycle selection is pending — the runtime keeps the Fast
-    /// timer cadence armed while true, so the idle-commit in `tick()` fires
-    /// promptly rather than waiting for the next Slow tick. Only the wasm
+    /// Whether a cycle selection is pending. After the sole outstanding
+    /// callback lands, the runtime switches to Fast until `tick()` commits
+    /// the selection. Only the wasm
     /// runtime (Task 5) reads this in production; pinned by a host test
     /// (`wants_fast_cadence_tracks_pending_selection_through_commit_and_cancel`).
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -296,15 +251,12 @@ impl Sessions {
 
     /// The shared ordering: the current session first (at most one — `own`,
     /// once known), then fresh attention>0 peers by name, then the rest of
-    /// the fresh peers by name, then every stale peer by name — a stale
-    /// peer's attention count is never actionable (it can't be cycled to),
-    /// so staleness outranks attention for ordering purposes. Both
-    /// `badge()` and `cycle()` go through this so "what's shown" and "what
-    /// Alt+[/] steps through" can never disagree.
+    /// the fresh peers by name. Stale peers remain remembered but are omitted.
+    /// Both `badge()` and `cycle()` go through this so "what's shown" and
+    /// "what Alt+[/] steps through" can never disagree.
     fn ordered(&self) -> Vec<OrderedEntry<'_>> {
         let mut attention: Vec<OrderedEntry> = Vec::new();
         let mut rest: Vec<OrderedEntry> = Vec::new();
-        let mut stale: Vec<OrderedEntry> = Vec::new();
         let own_name = self.own.as_ref().map(|p| p.session_name.as_str());
         for peer in &self.peers {
             // WHY: a peer presence sharing our own session's name is
@@ -319,10 +271,14 @@ impl Sessions {
             if own_name == Some(peer.presence.session_name.as_str()) {
                 continue;
             }
-            let entry = OrderedEntry { presence: &peer.presence, is_current: false, stale: peer.stale };
             if peer.stale {
-                stale.push(entry);
-            } else if peer.presence.attention > 0 {
+                continue;
+            }
+            let entry = OrderedEntry {
+                presence: &peer.presence,
+                is_current: false,
+            };
+            if peer.presence.attention > 0 {
                 attention.push(entry);
             } else {
                 rest.push(entry);
@@ -330,9 +286,11 @@ impl Sessions {
         }
         attention.sort_by(|a, b| a.presence.session_name.cmp(&b.presence.session_name));
         rest.sort_by(|a, b| a.presence.session_name.cmp(&b.presence.session_name));
-        stale.sort_by(|a, b| a.presence.session_name.cmp(&b.presence.session_name));
-        let current = self.own.as_ref().map(|p| OrderedEntry { presence: p, is_current: true, stale: false });
-        current.into_iter().chain(attention).chain(rest).chain(stale).collect()
+        let current = self.own.as_ref().map(|p| OrderedEntry {
+            presence: p,
+            is_current: true,
+        });
+        current.into_iter().chain(attention).chain(rest).collect()
     }
 }
 
@@ -529,46 +487,32 @@ mod tests {
         let mut s = Sessions::default();
         s.set_own(own("work"));
         s.update_presences(vec![presence("alpha", 1, 0), presence("beta", 1, 0)]);
-        assert!(s.cycle(Direction::Next), "starting a selection flips a `selected` flag in the badge");
-        assert!(s.cycle(Direction::Next), "advancing the selection moves the `selected` flag");
-    }
-
-    #[test]
-    fn dismiss_removes_peer_entry() {
-        let mut s = Sessions::default();
-        s.set_own(own("work"));
-        s.update_presences(vec![presence("alpha", 2, 1)]);
-
-        assert!(s.dismiss("alpha"), "dismissing an existing peer changes the badge");
         assert!(
-            !s.badge().iter().any(|b| b.name == "alpha"),
-            "dismissed peer must no longer appear on the badge"
+            s.cycle(Direction::Next),
+            "starting a selection flips a `selected` flag in the badge"
+        );
+        assert!(
+            s.cycle(Direction::Next),
+            "advancing the selection moves the `selected` flag"
         );
     }
 
     #[test]
-    fn dismiss_absent_name_is_noop() {
-        let mut s = Sessions::default();
-        s.set_own(own("work"));
-        s.update_presences(vec![presence("alpha", 2, 1)]);
-        let before = s.badge();
-
-        assert!(!s.dismiss("beta"), "dismissing a missing peer must report no badge change");
-        assert_eq!(s.badge(), before, "missing-name dismiss must not disturb the badge");
-    }
-
-    #[test]
-    fn dismissed_but_alive_session_reappears_fresh_on_next_presence_write() {
+    fn stale_but_alive_session_reappears_on_next_fresh_presence_write() {
         let mut s = Sessions::default();
         s.set_own(own("work"));
         s.update_presences(vec![presence_aged("alpha", 2, 1, STALE_AFTER_SECS + 1)]);
-        assert!(s.dismiss("alpha"), "setup: stale peer is dismissed locally");
-        assert!(!s.badge().iter().any(|b| b.name == "alpha"));
+        assert!(
+            !s.badge().iter().any(|b| b.name == "alpha"),
+            "setup: stale peer is hidden"
+        );
 
         s.update_presences(vec![presence_aged("alpha", 2, 1, 0)]);
 
-        let alpha = s.badge().into_iter().find(|b| b.name == "alpha").expect("fresh write makes alpha reappear");
-        assert!(!alpha.stale, "a live session's fresh write must reappear as fresh, not stale");
+        assert!(
+            s.badge().iter().any(|b| b.name == "alpha"),
+            "a live session's fresh write must reappear"
+        );
     }
 
     // -- Selection identity (not positional index) ---------------------------
@@ -694,20 +638,20 @@ mod tests {
         assert_eq!(work_entries[0].attention, 0, "own's own-known counts must win over a peer claiming the same name");
     }
 
-    // -- Pinning: persistent roster (task-14) --------------------------------
-    // A remembered session must never silently vanish from the badge. Peers
-    // past `STALE_AFTER_SECS` mark stale (dimmed by the renderer, unreachable
-    // via `cycle()`) instead of disappearing; only the open-time
-    // `PRESENCE_MAX_AGE` sweep (6h) actually forgets one.
+    // -- Pinning: bounded session liveness -----------------------------------
+    // A missed heartbeat does not destroy remembered peer state. Once a peer
+    // passes `STALE_AFTER_SECS`, however, it is hidden from the badge and cycle
+    // until a fresh heartbeat makes it visible again.
 
     #[test]
-    fn stale_peer_is_flagged_and_skipped_by_cycle() {
+    fn stale_peer_is_hidden_and_skipped_by_cycle() {
         let mut s = Sessions::default();
         s.set_own(own("work"));
         s.update_presences(vec![presence_aged("alpha", 1, 0, 400)]); // well past STALE_AFTER_SECS
-        let badge = s.badge();
-        let alpha = badge.iter().find(|b| b.name == "alpha").expect("stale peer still on the badge");
-        assert!(alpha.stale, "a peer whose mtime age exceeds STALE_AFTER_SECS must flag stale");
+        assert!(
+            !s.badge().iter().any(|b| b.name == "alpha"),
+            "a peer whose mtime age exceeds STALE_AFTER_SECS must be hidden"
+        );
 
         // The ONLY peer is stale — cycle() must find nothing selectable and
         // stay a no-op, never landing on the likely-dead session.
@@ -721,7 +665,7 @@ mod tests {
         let mut s = Sessions::default();
         s.set_own(own("work"));
         s.update_presences(vec![presence_aged("alpha", 1, 0, 400), presence("beta", 1, 0)]);
-        // Order: work (current), beta (fresh, before the stale bucket), alpha (stale, last).
+        // Visible order: work (current), beta (fresh); alpha is hidden as stale.
         s.cycle(Direction::Next);
         let badge = s.badge();
         let selected: Vec<&str> = badge.iter().filter(|b| b.selected).map(|b| b.name.as_str()).collect();
@@ -729,20 +673,26 @@ mod tests {
     }
 
     #[test]
-    fn fresh_to_stale_transition_flips_on_age() {
+    fn fresh_to_stale_transition_hides_on_age() {
         let mut s = Sessions::default();
         s.set_own(own("work"));
         s.update_presences(vec![presence_aged("alpha", 1, 0, 10)]); // fresh
-        assert!(!s.badge()[1].stale, "a recently-heartbeated peer must not start stale");
+        assert!(
+            s.badge().iter().any(|b| b.name == "alpha"),
+            "a recently-heartbeated peer must be visible"
+        );
 
         // The next read finds the same peer with an older mtime age (no
-        // further heartbeat landed) — its badge row must flip to stale.
+        // further heartbeat landed) — its badge row must disappear.
         s.update_presences(vec![presence_aged("alpha", 1, 0, 200)]);
-        assert!(s.badge()[1].stale, "a peer whose age crossed STALE_AFTER_SECS must flip to stale");
+        assert!(
+            !s.badge().iter().any(|b| b.name == "alpha"),
+            "a peer whose age crossed STALE_AFTER_SECS must be hidden"
+        );
     }
 
     #[test]
-    fn stale_entry_superseded_by_a_fresh_same_name_presence_undims() {
+    fn stale_entry_superseded_by_a_fresh_same_name_presence_reappears() {
         // The recreation case: a session dies (its old file ages past
         // STALE_AFTER_SECS) and gets recreated under the same name — a
         // fresh presence file, young mtime, higher `updated_epoch_s`. The
@@ -754,21 +704,28 @@ mod tests {
         let corpse = r#"{"session_name":"alpha","running":1,"attention":0,"updated_epoch_s":10}"#;
         let recreated = r#"{"session_name":"alpha","running":0,"attention":0,"updated_epoch_s":20}"#;
         s.update_presences(vec![(corpse.to_string(), 400), (recreated.to_string(), 0)]);
-        let alpha = s.badge().into_iter().find(|b| b.name == "alpha").expect("alpha present");
-        assert!(!alpha.stale, "the fresher recreation must win the dedup, undimming the entry");
+        assert!(
+            s.badge().iter().any(|b| b.name == "alpha"),
+            "the fresher recreation must win the dedup and reappear"
+        );
     }
 
     #[test]
-    fn roster_survives_beyond_the_old_liveness_ttl() {
-        // The old design would have had `session_files::read_peer_presences`
-        // itself drop a peer at 180s. Task-14: it now returns unconditionally,
-        // and this module marks stale rather than dropping — an entry with
-        // age 400s (well past the old TTL) must still be on the badge.
+    fn stale_peer_is_hidden_but_remembered_until_file_cleanup() {
         let mut s = Sessions::default();
         s.set_own(own("work"));
         s.update_presences(vec![presence_aged("alpha", 1, 0, 400)]);
-        let badge = s.badge();
-        assert!(badge.iter().any(|b| b.name == "alpha"), "a peer must never be dropped for being old — only marked stale");
+
+        assert!(
+            !s.badge().iter().any(|b| b.name == "alpha"),
+            "an old peer must not remain visible"
+        );
+        assert!(
+            s.peers
+                .iter()
+                .any(|peer| peer.presence.session_name == "alpha" && peer.stale),
+            "staleness must hide remembered state rather than destroy it"
+        );
     }
 
     #[test]

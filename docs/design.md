@@ -9,10 +9,10 @@ removal — see `smart-tabs-postmortem.md` — and the focus-removal refactor)
 > Zellij setup after it melted down under a many-agent workload (poll-every-pane-on-every-output
 > issuing blocking host calls on the server's single main thread — full writeup in
 > `smart-tabs-postmortem.md`). This invalidates the earlier plan to *keep* smart-tabs for base
-> tab naming. **zj-radar now owns all tab display, including naming** (see §6.1). The hard
-> architectural constraint that follows: zj-radar must never issue blocking host queries
-> (`get_pane_running_command`, `get_pane_cwd`, …) — all signals come from pushed events
-> (`pipe`, `TabUpdate`, `PaneUpdate`, `CwdChanged`) or the hook payload.
+> tab naming. **zj-radar now owns all tab display, including naming** (see §6.1). Runtime
+> state comes from pushed events (`pipe`, `TabUpdate`, `PaneUpdate`, `CwdChanged`) or hook
+> payloads. The sole host-query exception is one bounded `get_pane_cwd` bootstrap for each
+> newly seen terminal pane; it never runs on output, render, or a timer.
 
 ## 1. Goal
 
@@ -58,17 +58,17 @@ This mirrors Cmux's real status path while fitting Zellij's plugin architecture.
 ║● 1 dotfiles         ║│                            │
 ║  main · done 2m     ║│   focused tab content      │
 ║  "refactored the…"  ║│                            │
-║◐ 2 pinky      2/4   ║│                            │
+║⠉⠃ 2 pinky      2/4   ║│                            │
 ║  fix/x · 0:14       ║│                            │
 ║  "running tests…"   ║│                            │
-║◑ 3 api              ║│                            │
+║⣿ 3 api              ║│                            │
 ║  feat/y · needs you ║│                            │
 ║○ 4 notes            ║│                            │
 ╚════════════════════╝└────────────────────────────┘
  NORMAL  <p>ane <t>ab …   ← existing status-bar, untouched
 ```
 
-- `✗` red = error · `◆` orange = waiting-for-you (pending) · `⠋` spinner = working ·
+- `✗` red = error · `◆` orange = waiting-for-you (pending) · `⠉⠃` spinner = working ·
   `●` green = done · `○` dim = plain terminal (no agent). (The shipped glyph set —
   the sketch above shows the layout, not final glyphs; `docs/rail-reference.md` is
   the executable spec for the rendered rail.)
@@ -103,8 +103,8 @@ runtime.
 │ Claude → plugin hook / native CLI  (running/pending/done) │
 │ Codex  → native CLI via hooks.json (running/pending/done) │
 └───────────────────────────┬───────────────────────────────┘
-   zellij pipe --name zj_radar.status.v1 -- {v,source,pane,status,repo,branch,msg}
-   (BROADCAST by name — not --plugin: see §6)
+   zellij pipe --name zj_radar.status.v1 -- {v,source,pane,status,…}
+   (targets every instance of the managed radar alias)
                             │
                             ▼
 ┌ zj-radar plugin (Rust → wasm32-wasip1) ────────────────────────────────┐
@@ -150,7 +150,7 @@ effects. The real external seam remains the **pipe payload schema** (versioned).
 | Claude `UserPromptSubmit` / `PreToolUse` / `PostToolUse` | `running` |
 | Claude `Notification` (`permission_prompt` / `elicitation_dialog` matchers) | `pending` |
 | Claude `Stop`                                 | `done`    |
-| Claude `SessionStart` (`source:"clear"` only) | `idle` (resets a stale row on `/clear`) |
+| Claude `SessionStart` (`startup`, `resume`, or `clear`) | `idle` (resets stale state before a session starts) |
 | Claude `SessionEnd`                           | `idle` (a closed session recedes instead of freezing its last status) |
 | Codex `UserPromptSubmit` / tool hooks / subagents | `running` |
 | Codex `PermissionRequest`                     | `pending` |
@@ -187,9 +187,9 @@ tab), so tab state cannot come from names. The store keys by `PaneId`; `PaneUpda
 
 ## 5. The pipe contract (producer ↔ plugin seam)
 
-Broadcast by name `zj_radar.status.v1` (namespaced + versioned). Each sidebar instance
-filters on the name and keeps its own copy of the state map (same pattern as the built-in
-tab-bar; cheap for a handful of tabs).
+Target the managed `radar` alias on the namespaced, versioned
+`zj_radar.status.v1` pipe. Zellij delivers the message to every running instance
+of that destination; each sidebar keeps its own copy of the state map.
 
 **Newcomer rehydration (session snapshot).** Because the plugin lives in the tab template,
 Zellij runs *one instance per tab*, and a broadcast only reaches instances alive when it is
@@ -266,18 +266,15 @@ unaffected.
   panes, never need to know the plugin's URL/config identity, and naturally reach every
   already-running sidebar instance. (A `--plugin` destination can also load the plugin if not
   running and the routing across multiple same-plugin instances is fiddly — avoid it here.)
-- **Timer is one-shot** in Zellij: re-arm each tick.
-  ```rust
-  // load():   set_timeout(1.0);
-  // update(Event::Timer(_)):  tick_elapsed(); set_timeout(1.0); return true;
-  ```
-  Optimization: only keep re-arming while there is something to tick *for* — either
-  animating work (a `Running` agent/command whose glyph spins) or an un-carried
-  completion edge (a `status_pipe` payload defers its recede + notification to the
-  timer). A backgrounded `done`/`error`/`pending` row is terminal: once its one-shot
-  settle has run it does **not** keep the loop alive, so an idle-but-lit rail stops
-  waking every second. The loop re-arms on the next pipe/PaneUpdate. (See
-  `PluginRuntime::timer_should_continue`.)
+- **Timer is one-shot** in Zellij: re-arm after every live fire. `Fast` fires
+  every 0.125s for visual animation; every eighth Fast fire advances the 1 Hz
+  domain clock used by debounce, TTL, permission, presence, and notification
+  work. A named rail with no Fast work uses `Idle`: one domain tick and peer
+  scan per second, but no animation-only frames. Its own presence heartbeat is
+  persisted every 60 domain ticks. Exactly one timeout may be outstanding;
+  its stored cadence, not the host-reported delay, identifies the callback.
+  An Idle-to-Fast transition therefore waits at most for the current 1s Idle
+  callback and cannot create overlapping timer chains.
 - **Layout — the integration seam.** The sidebar is a pinned, borderless left column *inside* a
   vertical split, *outside* `children`, so `swap_tiled_layout` cycling never disturbs it (same
   mechanism as the existing bars; 0.44.3 has the pop-out fix). The layout layer is the *only*
@@ -439,18 +436,19 @@ v1 = through Phase 3. Phase 1 alone is already a usable sidebar.
    deliberately; collapse toggle (future) mitigates.
 4. **`zellij-tile` API churn** — pin to 0.44.x; read `PaneInfo`/`TabInfo` field ordering and the
    `PaneId` enum against the 0.44.3 tag.
-5. **Per-tab plugin instances** (N timers + N state copies) — the only-tick-while-active
-   optimization bounds the timers, and the state copies are reconciled through `SessionFiles`
+5. **Per-tab plugin instances** (N timers + N state copies) — only Fast animation
+   is activity-gated; each named quiet instance keeps one 1 Hz Idle timer for a
+   shared presence-directory read. State copies reconcile through `SessionFiles`
    (see §5 "Newcomer rehydration"). The trap here, learned the hard way: a broadcast is *not*
    replayed to instances spawned later, so a new tab's instance starts blank — hence the snapshot
    seed. Note `/data` is per-instance (`…/<plugin_id>-<client_id>/`) despite the docs calling it
    "shared"; `/cache` (`…/plugin_cache/`) is the genuinely shared one in Zellij 0.44, with
    `/tmp/zj-radar` as a degraded fallback.
 6. **Repeating the smart-tabs meltdown** (`smart-tabs-postmortem.md`) — bounded *by design*:
-   zj-radar is push-driven (hook `pipe` + `TabUpdate`/`PaneUpdate`/`CwdChanged`) and issues no
-   blocking `get_pane_*` queries, so high-output panes cost it nothing and there is no poll loop
-   to storm the server's main thread. The standing rule (no blocking host calls on any path)
-   keeps it that way; any future naming/program feature must stay event-sourced (§6.1).
+   zj-radar is push-driven (hook `pipe` + `TabUpdate`/`PaneUpdate`/`CwdChanged`), so
+   high-output panes cost it nothing and there is no poll loop to storm the server's main
+   thread. Its only `get_pane_*` call is a once-per-new-pane cwd bootstrap, capped per update;
+   any future naming/program feature must stay event-sourced (§6.1).
 
 ## 12. Out of scope (follow-ups)
 
@@ -505,30 +503,30 @@ ticking alone on an unchanged session never re-writes the file. Withheld
 entirely while `own_session_name` is empty (see below), since an unnamed
 presence file is useless to a peer.
 
-**Liveness heartbeat + staleness (task-14: never a hard drop).** Peers never
-call `SessionUpdate`/`get_session_list` to learn who's out there (see "Why
-not `SessionUpdate`" below) — liveness is read from the filesystem, not
-asked for. Peer sessions re-read the shared directory only on Fast (1 Hz)
-timer fires (`Effect::ReadPresences`; never on the Slow heartbeat — one
-directory scan per second, only while Fast is armed). `read_peer_presences`
-returns every peer file it finds, unconditionally, each paired with its
-file's mtime age; `Sessions::update_presences` turns that age into a
-per-entry fresh/stale state (`STALE_AFTER_SECS`, 90s) rather than dropping
-the entry — a session the badge has ever shown must never silently vanish
-from it (user decision, task-14). A stale entry dims on the badge and is
-unreachable via `session-next`/`session-prev`, but stays visible; nothing is
-ever deleted by a reader, which only ever judges a peer's file, never
-mutates it. Staleness mostly bites a session with nothing to report:
-because `PersistPresence` is content-edge-gated, a session sitting fully
-idle (no Fast-cadence work, no count change) would otherwise let its file's
-mtime age past 90s and dim on every peer's badge while still alive. The fix
-is a **liveness heartbeat**: `timer` unconditionally re-emits
-`PersistPresence` on every Slow (60s) fire, bypassing the edge gate, purely
-to keep the mtime fresh — 60s heartbeat against a 90s stale threshold is
-50% margin against one missed beat. Separately, a `6h` sweep
-(`PRESENCE_MAX_AGE`) deletes genuinely abandoned presence files at plugin
-`load()` — the only true forgetting, unrelated to (and much looser than)
-the 90s stale threshold.
+**Liveness heartbeat + staleness (task-14).** Peers never call
+`SessionUpdate`/`get_session_list` to learn who's out there (see "Why not
+`SessionUpdate`" below) — liveness is read from the filesystem, not asked
+for. Peer sessions re-read the shared directory on every 1 Hz domain tick:
+Fast edges during work and Idle fires when a named rail is otherwise quiet.
+`read_peer_presences` returns every peer file it finds, each paired with its
+file's mtime age; `Sessions::update_presences` retains each peer record but
+uses that age for badge and session-cycling eligibility. Once a read observes
+an age beyond `STALE_AFTER_SECS` (90s), the peer is omitted from both; its
+presence state and file remain untouched, and a fresh heartbeat makes it
+reappear on the next read. Readers only judge a peer's file and never mutate
+it.
+
+Staleness mostly bites a session with nothing to report: because
+`PersistPresence` is content-edge-gated, a session sitting fully idle (no
+Fast-cadence work, no count change) would otherwise let its file's mtime age
+past 90s despite still being alive. The named-session **Idle cadence** runs
+domain work at 1 Hz without Fast's eight visual repaints: every fire emits
+`ReadPresences`, and every 60th domain tick unconditionally emits
+`PersistPresence`. Thus stale peers disappear or recover within about a second,
+while the 60s own heartbeat retains 50% margin against the 90s threshold.
+Separately, a conservative `6h` sweep (`PRESENCE_MAX_AGE`) deletes genuinely
+abandoned presence files at plugin `load()` — the only true forgetting,
+unrelated to (and much looser than) the 90s stale threshold.
 
 **Own session name.** Zellij's `Event::ModeUpdate` carries
 `ModeInfo.session_name`; the plugin already subscribes to `ModeUpdate` for
@@ -550,37 +548,29 @@ avoid (`smart-tabs-postmortem.md`). The fix (task-8b) drops `SessionUpdate`
 entirely: liveness is derived purely from the presence files' own mtimes,
 and the session's own name arrives push-style via `Event::ModeUpdate`
 instead of a session-list lookup. Net effect: presence is entirely
-peer-published and liveness is entirely mtime-based — whatever a
-Fast-cadence directory read hands back IS the peer set for that tick, every
-member forever (task-14 dropped the read-time filter too); staleness is a
-display/cycle-eligibility state derived from that same mtime, not a
-membership filter. No membership roster to keep in sync with a second
+peer-published and liveness is entirely mtime-based — whatever the latest
+directory read hands back is retained as the peer set for that tick; mtime
+then applies a 90s badge/cycle-eligibility filter without
+discarding a peer record. No membership roster to keep in sync with a second
 signal, no `get_session_list` call anywhere in the plugin.
 
 **Badge.** `Sessions::badge()` (pure, re-derived on every call — never
-cached, so it can't drift from `peers`/`own`) renders **zero lines** while
-only the current session's presence is known (a lone fresh own-entry plus
-only stale peers still clears that threshold — task-14: the roster's whole
-point is remembering); from 2+ entries on, one line per session in a single
-fixed order shared with cycling: current session first, then any FRESH peer
-with `attention > 0` by name, then the rest of the fresh peers by name, then
-every STALE peer by name (a stale peer's attention count isn't actionable,
-so staleness outranks attention for ordering). Each line shows the session
-name plus a running count and an attention count when nonzero, using the
-same glyphs the per-tab rows use for those statuses. The current line is
-marked (dimmed, a small `•`) and carries no click target — you can't switch
-to the session you're already in. A pending cycle selection renders
-bold+accent; a stale entry renders one step dimmer than the ordinary muted
-line color, but stays fully clickable — a click on it is a deliberate act.
-Clicking any other line switches to that session, landing on its
-`attention_tab_position` if it has one.
+cached, so it can't drift from `peers`/`own`) renders **zero lines** while no
+fresh peer is available. Otherwise, it uses one fixed order shared with
+cycling: current session first, then fresh peers with `attention > 0` by
+name, then the remaining fresh peers by name. Each line shows the session
+name plus a running count and an attention count when nonzero, using the same
+glyphs the per-tab rows use for those statuses. The current line is marked
+(muted, with a small `•`) and carries no click target — you can't switch to
+the session you're already in. Each fresh peer line is clickable and switches
+to that session, landing on its `attention_tab_position` if it has one.
 
-**Cycling.** `session-next`/`session-prev`, delivered on the `zj_radar.cmd.v1`
-pipe (documented for operators in `docs/configuration.md`), advance a
-highlighted selection through that same shared order, wrapping, with the
-current session included as a normal stop and every STALE peer excluded
-entirely (task-14: switching onto a likely-dead session would have Zellij
-resurrect it as an empty zombie pane). A tap only moves the highlight
+**Cycling.** `session-next`/`session-prev`, delivered on the
+`zj_radar.cmd.v1` pipe (documented for operators in
+`docs/configuration.md`), advance a highlighted selection through that same
+fresh-session order, wrapping, with the current session included as a normal
+stop. A peer observed beyond the 90-second heartbeat threshold is excluded
+until a fresh heartbeat makes it eligible again. A tap only moves the highlight
 (`Sessions::cycle`, which arms a per-selection "a tap landed" flag) — the
 actual switch is a later **idle-commit**: `Sessions::tick` runs on every
 timer fire while a selection is pending, and a fire whose covered interval

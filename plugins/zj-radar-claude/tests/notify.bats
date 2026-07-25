@@ -62,14 +62,33 @@ teardown() { teardown_fakes; }
   [ "$(jq -r '.status' <<<"$output")" = done ]
 }
 
-@test "hooks.json wires SessionStart{clear} to notify.sh idle" {
-  # The fix for the /clear stale-status bug: SessionStart fires on clear; the
-  # matcher scopes the reset to `clear` only (never startup/resume/compact),
-  # mirroring how Notification scopes to permission_prompt.
+@test "hooks.json wires supported SessionStart sources to notify.sh idle" {
+  # Startup, resume, and /clear announce/reset the pane. Compact is deliberately
+  # excluded because compaction inside a live turn must not clear Running.
   local hooks="$BATS_TEST_DIRNAME/../hooks/hooks.json"
-  [ "$(jq -r '.hooks.SessionStart[0].matcher' "$hooks")" = clear ]
+  [ "$(jq -r '.hooks.SessionStart[0].matcher' "$hooks")" = "startup|resume|clear" ]
   local cmd; cmd="$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$hooks")"
   [[ "$cmd" == *"notify.sh idle"* ]]
+}
+
+@test "SessionStart startup broadcasts idle with blank msg and Claude source" {
+  echo '{"hook_event_name":"SessionStart","source":"startup","cwd":"/home/u/myrepo"}' | "$SCRIPT" idle
+  run last_payload
+  [ "$(jq -r '.status' <<<"$output")" = idle ]
+  [ "$(jq -r '.msg' <<<"$output")" = "" ]
+  [ "$(jq -r '.source' <<<"$output")" = claude ]
+}
+
+@test "SessionStart compact produces no hook command" {
+  local hooks="$BATS_TEST_DIRNAME/../hooks/hooks.json"
+  run jq -r --arg source compact '
+    .hooks.SessionStart[]
+    | . as $entry
+    | select($source | test($entry.matcher))
+    | .hooks[].command
+  ' "$hooks"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }
 
 @test "hooks.json wires SessionEnd to notify.sh idle" {

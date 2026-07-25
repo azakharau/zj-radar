@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/plugin"]
+members = ["crates/core", "crates/cli", "crates/plugin", "crates/agents"]
 
 [workspace.package]
 version = "0.2.2"
@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"] }
 kdl = { version = "6", features = ["v1-fallback"] }
 toml_edit = "0.22"
 dirs = "5"
+libc = "0.2"
 insta = { version = "1", features = ["filters"] }
 proptest = "1"
 vt100 = "0.15"

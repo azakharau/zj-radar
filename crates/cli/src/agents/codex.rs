@@ -23,6 +23,10 @@ fn derive_hook_update(v: &Value) -> Option<AgentUpdate> {
     let event = v.get("hook_event_name")?.as_str()?;
     let cwd = string_field(v, "cwd");
     let (status, msg) = match event {
+        "SessionStart" => match v.get("source").and_then(Value::as_str) {
+            Some("startup" | "resume" | "clear") => (Status::Idle, String::new()),
+            _ => return None,
+        },
         "UserPromptSubmit" => (Status::Running, "working".to_string()),
         "PreToolUse" | "PostToolUse" => {
             let tool_name = v.get("tool_name").and_then(|x| x.as_str()).unwrap_or("");
@@ -274,6 +278,24 @@ mod tests {
     }
 
     #[test]
+    fn supported_session_starts_are_idle_with_blank_identity() {
+        for source in ["startup", "resume", "clear"] {
+            let u = update(&format!(
+                r#"{{"hook_event_name":"SessionStart","source":"{source}","cwd":"/repo"}}"#
+            ));
+            assert_eq!(
+                u,
+                AgentUpdate {
+                    status: Status::Idle,
+                    msg: String::new(),
+                    cwd: Some("/repo".into()),
+                    task: None,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn unknown_or_bad_events_are_noops() {
         let none = |raw: &str| {
             derive(&Intake {
@@ -283,6 +305,8 @@ mod tests {
         };
         assert!(none("not json").is_none());
         assert!(none(r#"{"hook_event_name":"SessionStart"}"#).is_none());
+        assert!(none(r#"{"hook_event_name":"SessionStart","source":"compact"}"#).is_none());
+        assert!(none(r#"{"hook_event_name":"SessionStart","source":"future"}"#).is_none());
         assert!(none(r#"{"type":"task-started"}"#).is_none());
     }
 

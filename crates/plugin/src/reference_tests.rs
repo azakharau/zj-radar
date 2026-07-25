@@ -23,6 +23,8 @@ struct Case {
     expect: String,
 }
 
+
+
 // ── Parser ──────────────────────────────────────────────────────────────────
 
 /// Scan `doc` for `## <heading>` markers followed by ```rail-input``` and
@@ -429,6 +431,7 @@ fn build(input: &str) -> (Vec<TabRow>, Vec<crate::rollup::LedgerLine>, RenderOpt
                 id: p.pane_id,
                 title: p.msg.clone(),
                 focused_in_tab: false,
+                push_owned: false,
             }
         }).collect();
         if !terminal_panes.is_empty() {
@@ -486,6 +489,7 @@ fn build(input: &str) -> (Vec<TabRow>, Vec<crate::rollup::LedgerLine>, RenderOpt
                     task: pane.task.clone(),
                     source: source.to_string(),
                     ack: false,
+                    gone: false,
                 });
                 radar.status_pipe(&wire_running, 0, 0, NamingMode::Off);
 
@@ -498,6 +502,7 @@ fn build(input: &str) -> (Vec<TabRow>, Vec<crate::rollup::LedgerLine>, RenderOpt
                     task: "".into(),
                     source: source.to_string(),
                     ack: false,
+                    gone: false,
                 });
                 radar.status_pipe(&wire_idle, 1, 0, NamingMode::Off);
             } else {
@@ -510,6 +515,7 @@ fn build(input: &str) -> (Vec<TabRow>, Vec<crate::rollup::LedgerLine>, RenderOpt
                     task: pane.task.clone(),
                     source: source.to_string(),
                     ack: false,
+                    gone: false,
                 });
                 // Applied "now" relative to the render epoch, backdated by the
                 // `waiting <N>m` trailer — how the doc's pending scenarios earn
@@ -554,6 +560,7 @@ fn build(input: &str) -> (Vec<TabRow>, Vec<crate::rollup::LedgerLine>, RenderOpt
                     id: p.pane_id,
                     title: p.msg.clone(),
                     focused_in_tab: false,
+                    push_owned: false,
                 }
             }).collect();
             if !terminal_panes.is_empty() {
@@ -586,6 +593,9 @@ fn build(input: &str) -> (Vec<TabRow>, Vec<crate::rollup::LedgerLine>, RenderOpt
         theme,
         now_epoch_s: LEDGER_NOW_EPOCH_S,
         jump_hint,
+        agents_only: false,
+        agents_offset: 0,
+        agents_pad_top: 0,
         // The reference doc's scenarios are all single-session — the badge
         // stays invisible (`render_session_badge`'s `len() <= 1` gate), same
         // as every rail-reference.md fixture predates this field.
@@ -668,4 +678,3 @@ fn rail_reference_matches() {
         failures.join("\n\n")
     );
 }
-

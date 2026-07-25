@@ -11,6 +11,7 @@ use crate::status::Status;
 use crate::status_store::StatusStore;
 use crate::tab_namer::{PaneFacts, TabFacts, TabNamer, TabRename};
 use crate::theme;
+use push_ownership::PushOwnership;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -104,6 +105,7 @@ pub(crate) struct RawPane {
     pub default_fg: Option<String>,
     pub exited: bool,
     pub exit_status: Option<i32>,
+    pub terminal_command: Option<String>,
 }
 
 impl PaneUpdate {
@@ -144,6 +146,11 @@ impl PaneUpdate {
                 id: p.id,
                 title: payload::sanitize(&p.title, payload::MAX_TAB_NAME_CHARS),
                 focused_in_tab: p.is_focused,
+                push_owned: p
+                    .terminal_command
+                    .as_deref()
+                    .and_then(|command| command.split_ascii_whitespace().next())
+                    .is_some_and(crate::command::is_push_producer_program),
             });
             live.insert(p.id);
             if p.exited {
@@ -193,11 +200,19 @@ pub(crate) struct RadarState {
     status: StatusStore,
     command: CommandStore,
     tabs: Vec<RadarTab>,
+    /// Tab topology (id→position mapping) changed and `tab_panes` may still
+    /// reflect the OLD positions — the position-keyed join is untrustworthy
+    /// until things settle. While set, `rename_tabs` emits nothing (a wrong
+    /// join would DURABLY rename tabs after their neighbors — the
+    /// new-tab-next-to-current cascade). Cleared by the 1s timer; rendering
+    /// is unaffected (it self-heals on the next event).
+    topology_dirty: bool,
     tab_panes: HashMap<usize, Vec<TerminalPane>>,
     pane_cwd: HashMap<u32, String>,
     namer: TabNamer,
     last_focused: Option<u32>,
     live_panes: Option<HashSet<u32>>,
+    push_ownership: PushOwnership,
     /// Pane ids we have already requested an initial `get_pane_cwd` read for.
     /// Tracks *attempts*, not successes, so a pane that has no cwd yet is never
     /// re-polled; pruned with `pane_cwd` so a recycled id can bootstrap again.
@@ -234,6 +249,7 @@ impl RadarState {
         let (observations, tick, ledger) = snapshot::load(raw)?;
         self.status = StatusStore::default();
         self.command = CommandStore::default();
+        self.push_ownership.restore(&observations);
         // This match is the SINGLE origin→store guard: each entry's intrinsic
         // origin (strict on deserialize) routes it to exactly one store, so the
         // stores trust what they're handed and don't re-check. Deserialize already
@@ -254,9 +270,10 @@ impl RadarState {
                 ObservationOrigin::StatusPipe => self
                     .status
                     .insert_snapshot_observation(pane_id, observation),
-                ObservationOrigin::Command => self
+                ObservationOrigin::Command if !self.push_ownership.owns(pane_id) => self
                     .command
                     .insert_snapshot_observation(pane_id, observation),
+                ObservationOrigin::Command => {}
             }
         }
         self.ledger.replace(ledger);
@@ -316,6 +333,15 @@ impl RadarState {
         for t in &mut tabs {
             t.name = payload::sanitize(&t.name, payload::MAX_TAB_NAME_CHARS);
         }
+        let mapping_changed = self.tabs.len() != tabs.len()
+            || !self
+                .tabs
+                .iter()
+                .zip(&tabs)
+                .all(|(a, b)| a.id == b.id && a.position == b.position);
+        if mapping_changed {
+            self.topology_dirty = true;
+        }
         self.tabs = tabs;
         // Sort once at intake — this is the only writer of `self.tabs`, so the
         // per-render `rows()` path iterates in stored order instead of paying a
@@ -362,8 +388,18 @@ impl RadarState {
         // (displacing nothing) is safe to skip too: exits ride the
         // level-triggered pane manifest, so a late-spawned instance re-derives
         // them from its own first PaneUpdate rather than the snapshot.
+        self.push_ownership.update_manifest(&update.tab_panes);
         let mut displaced_any = false;
+        for &pane_id in self.push_ownership.root_panes() {
+            displaced_any |= self.command.clear_push_owned(pane_id);
+        }
         for (pane_id, exit_status) in update.exits {
+            // A direct-root producer's manifest exit belongs to its status
+            // lifecycle. Feeding it to CommandStore would recreate a blank
+            // command-origin Done immediately after the clear above.
+            if self.push_ownership.is_root(pane_id) {
+                continue;
+            }
             if let Some(displaced) = self.command.on_exit(pane_id, exit_status, Tick(tick), EpochSecs(now_epoch_s)) {
                 self.ledger_receded(vec![(pane_id, displaced)], &old_index, &status_tracked);
                 displaced_any = true;
@@ -391,11 +427,13 @@ impl RadarState {
             .observations()
             .map(|(id, _)| id)
             .chain(self.command.tracked_pane_ids())
+            .chain(self.push_ownership.learned_panes().iter().copied())
             .filter(|id| !update.live.contains(id) && !absent_before.contains_key(id))
             .map(|id| (id, old_index.get(&id).cloned()))
             .collect();
         let effective_live: HashSet<u32> =
             update.live.iter().copied().chain(graced.keys().copied()).collect();
+        self.push_ownership.retain_live(&effective_live);
         // A confirmed-gone pane left the topology one manifest ago, so
         // `old_index` no longer carries it — the ledger files its recede under
         // the tab identity captured at first absence instead.
@@ -444,6 +482,9 @@ impl RadarState {
         // the map itself is only ever pruned here, on the one `&mut self` tick
         // that already runs regardless of flash state.
         self.flash_until.retain(|_, &mut u| tick < u);
+        // Tab moves/creations settle well within one timer period; the next
+        // rename trigger after this clear sees a consistent tabs×panes join.
+        self.topology_dirty = false;
         let report = self.command.on_timer(Tick(tick), EpochSecs(now_epoch_s));
         // All-command-origin recedes here; no pruning is in flight on this
         // edge, so the current topology/shadow set `ledger_recede_now`
@@ -471,100 +512,6 @@ impl RadarState {
             settle: false,
             ..RadarChange::default()
         }
-    }
-
-    /// Unlike the other mutating entry points, this one takes no `now_epoch_s`:
-    /// the displaced observation `clear_on_prompt_return` hands back already
-    /// carries its own `completed_epoch_s` stamp from when it first completed,
-    /// so `LedgerEntry::from_observation` needs no fresh epoch here — and
-    /// `CommandChanged` is the chattiest event in the system, so the caller
-    /// shouldn't pay a clock read for a value nothing consumes.
-    pub(crate) fn command_changed(
-        &mut self,
-        pane_id: u32,
-        command: &[String],
-        is_foreground: bool,
-        tick: u64,
-    ) -> RadarChange {
-        let cwd = self.pane_cwd.get(&pane_id).map(String::as_str);
-        self.command
-            .on_command_changed(pane_id, command, is_foreground, cwd, tick);
-        // A pane back at its shell prompt means the agent that was pushing status
-        // has exited (no producer hook fires on quit), so clear the now-stale
-        // pushed status → idle. This rides the shared `CommandChanged` signal, so
-        // every tab's instance clears in lockstep. A Running status is not
-        // cleared immediately — `clear_on_prompt_return` starts a grace clock
-        // instead, so a mid-turn foreground flicker to a shell can't be
-        // mistaken for the agent exiting, while an agent killed mid-turn still
-        // expires to idle on the timer (`expire_stale_running`).
-        let cleared = if crate::command::is_shell_prompt(command, is_foreground) {
-            match self.status.clear_on_prompt_return(pane_id, tick) {
-                Some(receded) => {
-                    // Status-origin recede: the shadow filter never suppresses
-                    // it — it only ever applies to Command-origin observations.
-                    self.ledger_recede_now(vec![(pane_id, receded)]);
-                    true
-                }
-                None => false,
-            }
-        } else {
-            // The agent's exe back in the foreground resolves a mid-turn
-            // flicker: cancel any stale-Running grace clock the shell blip
-            // started. Other foregrounds don't vouch — a command run in the
-            // shell an agent died in must not keep its ghost alive.
-            if crate::command::is_agent_foreground(command, is_foreground) {
-                self.status.cancel_running_suspect(pane_id);
-            }
-            false
-        };
-        RadarChange {
-            render: true,
-            settle: false,
-            // Persist only when we actually cleared, so a newly-opened tab
-            // rehydrates the idle from the snapshot rather than the stale status.
-            persist_snapshot: cleared,
-            ..RadarChange::default()
-        }
-    }
-
-    pub(crate) fn status_pipe(
-        &mut self,
-        raw: &str,
-        tick: u64,
-        now_epoch_s: u64,
-        naming: config::NamingMode,
-    ) -> Option<RadarChange> {
-        let p = payload::parse(raw)?;
-        let pane_id = p.pane_id;
-        // Captured BEFORE `apply` overwrites the store: the ping flash fires
-        // only on a LIVE not-Pending → Pending edge, never on a re-broadcast of
-        // an already-Pending status (spec's "flip", not "is"). Snapshot load
-        // never touches this map at all, so a restored Pending never flashes.
-        let was_pending = self.status.get(pane_id).map(|o| o.status) == Some(Status::Pending);
-        let flips_to_pending = p.status == Status::Pending && !was_pending;
-        // A Done/Error that recedes on overwrite (a new broadcast for the same
-        // pane, INCLUDING the `/clear` idle-overwrite edge) hands off here.
-        if let Some(displaced) = self.status.apply(p, tick, now_epoch_s) {
-            // Status-origin recede: never suppressed (see `command_changed`'s
-            // matching call site).
-            self.ledger_recede_now(vec![(pane_id, displaced)]);
-        }
-        if flips_to_pending {
-            if let Some((tab_id, _)) = self.pane_tab_index().get(&pane_id) {
-                self.flash_until.insert(*tab_id, tick + 2);
-            }
-        }
-        // NOTE: we deliberately do NOT settle here. A pushed status is shown as-is;
-        // focus no longer recedes or clears it. A completion clears only via a new
-        // broadcast for the pane, the return-to-shell exit-clear
-        // (`command_changed` → `clear_on_prompt_return`), or a prune.
-        Some(RadarChange {
-            render: true,
-            persist_snapshot: true,
-            renames: self.rename_tabs(naming),
-            cwd_bootstrap: Vec::new(),
-            settle: false,
-        })
     }
 
     /// True while any tracked pane is actively *working* — a status-pipe agent
@@ -665,17 +612,16 @@ impl RadarState {
             .collect()
     }
 
-    /// Any ledger entry still younger than the saturate window — drives the
-    /// Slow cadence (spec §4.4/§10) so the timer stays armed only while a row's
-    /// displayed age can still change. Consumed by `PluginRuntime::desired_cadence`.
+    /// Any ledger entry still younger than the saturate window. The runtime
+    /// uses this to skip minute-boundary repaints once every age says `1h+`.
     pub(crate) fn ledger_any_unsaturated(&self, now_epoch_s: u64) -> bool {
         self.ledger.any_unsaturated(now_epoch_s)
     }
 
     /// Any pushed `Pending` row whose `· Nm` wait tag is still counting (age
     /// under the ledger's saturate window)? The pending twin of
-    /// [`ledger_any_unsaturated`](Self::ledger_any_unsaturated): both feed the
-    /// Slow cadence, and both freeze at `1h+` so the timer can disarm.
+    /// [`ledger_any_unsaturated`](Self::ledger_any_unsaturated): both gate
+    /// minute-boundary repaints and freeze at `1h+`.
     pub(crate) fn pending_wait_unsaturated(&self, now_epoch_s: u64) -> bool {
         self.status.observations().any(|(_, o)| {
             o.status == Status::Pending
@@ -713,7 +659,7 @@ impl RadarState {
     }
 
     /// Pane ids currently seated in tab `position`, in `self.tab_panes`'s
-    /// stored order — `PluginRuntime::mouse_right_click` reads this to
+    /// stored order — `PluginRuntime::mouse_click` reads this to
     /// resolve a tab-row acknowledge (no `pane_id` on the click target) into
     /// the set of panes it should check for a dismissible `Pending`. Empty
     /// for an unknown position, same as every other `tab_panes` lookup here.
@@ -846,6 +792,8 @@ impl RadarState {
     #[cfg(test)]
     pub(crate) fn set_tab_panes_for_position(&mut self, position: usize, panes: Vec<TerminalPane>) {
         self.tab_panes.insert(position, panes);
+        // A test that hand-places panes is declaring the join consistent.
+        self.topology_dirty = false;
     }
 
     #[cfg(test)]
@@ -908,7 +856,14 @@ impl RadarState {
     /// naming module pick and remember names. `Off` short-circuits before any
     /// fact-building (the namer also no-ops on `Off`).
     fn rename_tabs(&mut self, naming_mode: config::NamingMode) -> Vec<TabRename> {
-        if naming_mode == config::NamingMode::Off {
+        if naming_mode == config::NamingMode::Off || self.topology_dirty {
+            return Vec::new();
+        }
+        // Structural cross-check: a pane bucket keyed to a position no tab
+        // holds means the manifest and the tab list disagree (mid-churn on a
+        // tab insert/close) — naming from that join would misattribute panes.
+        let positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
+        if self.tab_panes.keys().any(|k| !positions.contains(k)) {
             return Vec::new();
         }
         let facts = self.name_facts();
@@ -961,6 +916,7 @@ impl RadarState {
     }
 }
 
+mod push_ownership;
 mod snapshot;
 
 #[cfg(test)]

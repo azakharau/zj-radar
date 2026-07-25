@@ -87,8 +87,8 @@ pub fn diff(
     let mut out = Vec::new();
     for (&pane_id, &o) in current {
         // An acknowledged status arrived with the payload's `ack` flag — the
-        // user has already seen it (the rail's right-click "stop flagging
-        // this"), so its edge must never notify. Carried by the payload, NOT
+        // user has already seen it (the rail's "stop flagging this"
+        // acknowledgement), so its edge must never notify. Carried by the payload, NOT
         // inferred from the edge shape: a real Pending → Done edge (answer a
         // question, tab away, a short no-tool turn finishes) still notifies.
         if o.acknowledged {
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn acknowledged_observation_never_notifies() {
-        // The rail's right-click acknowledge converges Pending → Done via a
+        // The rail's pending-row acknowledgement converges Pending → Done via a
         // broadcast stamped `ack: true` — a background edge that would
         // otherwise notify. The whole gesture means "stop flagging this".
         let mut o = obs(Status::Done, "pinky", "main", "working");

@@ -14,8 +14,8 @@
    lines. The one exception (the ⟦D-timer⟧ "per-pane, not per-tab" answer,
    scoped to where waiting is *costly*): a `pending` pane's identity line
    carries a `· Nm` wait tag once it has waited ≥ 1 minute — whole minutes,
-   frozen at `1h+` (the ledger's saturate window, so the Slow heartbeat can
-   disarm). Under a minute, and for every other status, lines stay bit-identical
+   frozen at `1h+` (the ledger's saturation window, so this row stops requiring
+   an age-update cadence). Under a minute, and for every other status, lines stay bit-identical
    to the tagless rail. See scenario T5. ⟦D-timer ✓ pending-only⟧
 3. **One line per real pane — no collapsing.** Every *tracked* pane (an agent or
    a real command) gets its own line regardless of status or tab focus. No
@@ -38,7 +38,7 @@
 
 ## Vocabulary
 
-**Status glyphs (plain):** `○` idle · `⠋` working *(spins ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)* · `◆` needs-you ·
+**Status glyphs (plain):** `○` idle · `⠉⠃` working *(a 4-dot snake circling a 3×4 dot ring: ⠉⠃ ⠈⠇ ⠀⡇ …)* · `◆` needs-you ·
 `●` done · `✗` error.
 **Kind marks:** `✳` claude · `❉` codex · `✦` gemini · `$` command · `⚙` build ·
 `⚗` test · `⇡` deploy · `❯` server · `⦿` other.
@@ -57,9 +57,9 @@
 ════════════════════════════════   ← rule (32 wide)
  RADAR                     ·N n!   ← same, plus the needs-you badge when n>0
 ════════════════════════════════   ← rule (32 wide)
-▌⠋ 2 name                          ← tab row: [spine][glyph] [num] [name]
-▌├ ⠋ ❉ activity message            ← pane row: [spine][conn] [glyph] [mark] [msg]
-▌└ ● ⚙ activity message            ← last pane row uses the └ elbow connector
+▌⠉⠃ 2 name                          ← tab row: [spine][glyph] [num] [name]
+▌├ ⠉⠃ ❉ activity message            ← pane row: [spine][conn] [glyph] [mark] [msg]
+▌└ ●  ⚙ activity message            ← last pane row uses the └ elbow connector
 ```
 
 **Needs-you badge (Task 16).** The header's right slot appends `{n}!` — bold,
@@ -107,7 +107,7 @@ tab 1 "shell"
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ○ 1 shell
+ ○  1 shell
 ```
 
 > No legend, no permission marketing. Just the tab list. An unnamed tab renders
@@ -132,7 +132,7 @@ tab 4 "notes"
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ○ 4 notes
+ ○  4 notes
 ```
 
 ## C. Single agent — working
@@ -145,8 +145,8 @@ tab 1 "pinky"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 pinky
- └ ⠋ ✳ running tests…
+ ⠉⠃ 1 pinky
+ └ ⠉⠃ ✳ running tests…
 ```
 
 > Single-pane tabs render their one tracked pane through the SAME tree
@@ -164,8 +164,8 @@ tab 3 "api"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ◆ 3 api
- └ ◆ ✳ approve edit?
+ ◆  3 api
+ └ ◆  ✳ approve edit?
 ```
 
 ## E. Single agent — done
@@ -178,8 +178,8 @@ tab 1 "dotfiles"
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ● 1 dotfiles
- └ ● ✳ refactored the dotfiles
+ ●  1 dotfiles
+ └ ●  ✳ refactored the dotfiles
 ```
 
 ## F. Single agent — error
@@ -187,13 +187,13 @@ tab 1 "dotfiles"
 ```rail-input
 width 32
 tab 2 "build-svc"
-  claude error "exit 1: cargo test failed"
+  claude error "exit 1: cargo test fail…"
 ```
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ✗ 2 build-svc
- └ ✗ ✳ exit 1: cargo test failed
+ ✗  2 build-svc
+ └ ✗  ✳ exit 1: cargo test fail…
 ```
 
 ## G. Single command — build running
@@ -206,8 +206,8 @@ tab 1 "web"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 web
- └ ⠋ ⚙ cargo build
+ ⠉⠃ 1 web
+ └ ⠉⠃ ⚙ cargo build
 ```
 
 ## H. Multi-pane — the `af` case (line per pane)
@@ -223,9 +223,9 @@ tab 2 "af"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 2 af
- ├ ⠋ ❉ exploring render
- └ ● ⚙ cargo build
+ ⠉⠃ 2 af
+ ├ ⠉⠃ ❉ exploring render
+ └ ●  ⚙ cargo build
 ```
 
 > **Today** an unfocused `af` shows only `+1 working`. **Target:** both real
@@ -242,9 +242,9 @@ tab 4 "review"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ◆ 4 review
- ├ ◆ ✳ approve diff?
- └ ⠋ ❉ writing tests
+ ◆  4 review
+ ├ ◆  ✳ approve diff?
+ └ ⠉⠃ ❉ writing tests
 ```
 
 > Tab glyph is `◆` (dominant = needs-you). Panes in position order.
@@ -262,9 +262,9 @@ tab 2 "af"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 2 af
- ├ ⠋ ❉ exploring render
- └ ○ $ ./deploy.sh
+ ⠉⠃ 2 af
+ ├ ⠉⠃ ❉ exploring render
+ └ ○  $ ./deploy.sh
 ```
 
 > Contrast J with H: in H the second pane finished (`● done`); here it went
@@ -287,13 +287,13 @@ tab 2 "swarm"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 2 swarm
- ├ ⠋ ❉ planning api
- ├ ⠋ ❉ writing tests
- ├ ⠋ ❉ refactoring
- ├ ⠋ ❉ reviewing pr
- ├ ⠋ ❉ docs pass
- ├ ⠋ ❉ benchmarks
+ ⠉⠃ 2 swarm
+ ├ ⠉⠃ ❉ planning api
+ ├ ⠉⠃ ❉ writing tests
+ ├ ⠉⠃ ❉ refactoring
+ ├ ⠉⠃ ❉ reviewing pr
+ ├ ⠉⠃ ❉ docs pass
+ ├ ⠉⠃ ❉ benchmarks
  └ +1 more
 ```
 
@@ -317,12 +317,12 @@ tab 6 "logs"
 ```rail-expect
  RADAR                     6▲ 1!
 ◆═══════════════════════════════
- ◆ 1 review
- └ ◆ ✳ approve diff?
- ⠋ 2 af
- └ ⠋ ❉ exploring render
- ● 3 dotfiles
- └ ● ✳ refactored auth
+ ◆  1 review
+ └ ◆  ✳ approve diff?
+ ⠉⠃ 2 af
+ └ ⠉⠃ ❉ exploring render
+ ●  3 dotfiles
+ └ ●  ✳ refactored auth
 +3 idle ▾
 ```
 
@@ -340,9 +340,9 @@ tab 2 "af" active
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
-▌⠋ 2 af
-▌├ ⠋ ❉ exploring render
-▌└ ● ⚙ cargo build
+▌⠉⠃ 2 af
+▌├ ⠉⠃ ❉ exploring render
+▌└ ●  ⚙ cargo build
 ```
 
 > Identical content to H; focus only adds the `▌` spine (and a bg highlight, not
@@ -366,13 +366,13 @@ tab 1 "swarm"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 swarm
- ├ ⠋ ❉ pane one
- ├ ⠋ ❉ pane two
- ├ ⠋ ❉ pane three
- ├ ⠋ ❉ pane four
- ├ ⠋ ❉ pane five
- └ ⠋ ❉ pane six
+ ⠉⠃ 1 swarm
+ ├ ⠉⠃ ❉ pane one
+ ├ ⠉⠃ ❉ pane two
+ ├ ⠉⠃ ❉ pane three
+ ├ ⠉⠃ ❉ pane four
+ ├ ⠉⠃ ❉ pane five
+ └ ⠉⠃ ❉ pane six
 ```
 
 > 6 panes = exactly the cap; the `+N more` line does not appear. ⟦D6: cap=6⟧
@@ -396,13 +396,13 @@ tab 1 "swarm"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 swarm
- ├ ⠋ ❉ pane one
- ├ ⠋ ❉ pane two
- ├ ⠋ ❉ pane three
- ├ ⠋ ❉ pane four
- ├ ⠋ ❉ pane five
- ├ ⠋ ❉ pane six
+ ⠉⠃ 1 swarm
+ ├ ⠉⠃ ❉ pane one
+ ├ ⠉⠃ ❉ pane two
+ ├ ⠉⠃ ❉ pane three
+ ├ ⠉⠃ ❉ pane four
+ ├ ⠉⠃ ❉ pane five
+ ├ ⠉⠃ ❉ pane six
  └ +2 more
 ```
 
@@ -410,7 +410,7 @@ tab 1 "swarm"
 
 ## P. Truncation at width 32
 
-**Author-from-intent.** Multi-pane tab: pane line prefix is `" " + conn(1) + " " + glyph(1) + " " + mark(1) + " "` = 7 visible cols; avail = 25; truncate at 24 chars + `…`. The 51-char msg is clipped to `this message is quite lo…`.
+**Author-from-intent.** Multi-pane tab: pane line prefix is `" " + conn(1) + " " + glyph(1) + " " + mark(1) + " "` = 7 visible cols; avail = 25; truncate at 24 chars + `…`. The 51-char msg is clipped to `this message is quite l…`.
 
 ```rail-input
 width 32
@@ -421,9 +421,9 @@ tab 1 "work"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 work
- ├ ⠋ ✳ this message is quite lo…
- └ ● ⚙ ok
+ ⠉⠃ 1 work
+ ├ ⠉⠃ ✳ this message is quite l…
+ └ ●  ⚙ ok
 ```
 
 > Prefix = 7 cols; avail = 25; budget = 24 + `…`. Exercises `emit_pane_line` truncation. ⟦D8: width=32⟧
@@ -441,9 +441,9 @@ tab 1 "cjk"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 cjk
- ├ ⠋ ✳ 処理中のメッセージが長す…
- └ ● ⚙ ok
+ ⠉⠃ 1 cjk
+ ├ ⠉⠃ ✳ 処理中のメッセージが長…
+ └ ●  ⚙ ok
 ```
 
 > CJK chars are width-2; unicode-width truncation keeps the line at ≤32 display cols.
@@ -459,14 +459,14 @@ tab 1 "alerts" bell
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ○ 1 alerts                   ⚑
+ ○  1 alerts                  ⚑
 ```
 
 > Bell token on the `tab` line sets `has_bell=true`; the `⚑` glyph appears right-aligned. Tab-line trailing space after `⚑` is trimmed by the vt100 grid helper.
 
 ## S. Bell with running agent
 
-**Author-from-intent.** Bell + single tracked pane — exercises bell on a non-idle tab. `⠋ 1 pinky` + spaces + `⚑`, then the pane line (no bell on pane lines).
+**Author-from-intent.** Bell + single tracked pane — exercises bell on a non-idle tab. `⠉⠃ 1 pinky` + spaces + `⚑`, then the pane line (no bell on pane lines).
 
 ```rail-input
 width 32
@@ -476,8 +476,8 @@ tab 1 "pinky" bell
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 pinky                    ⚑
- └ ⠋ ✳ running tests
+ ⠉⠃ 1 pinky                   ⚑
+ └ ⠉⠃ ✳ running tests
 ```
 
 ## T. Untracked-only tab (D4 prompt-exclusion)
@@ -492,14 +492,14 @@ tab 1 "shell"
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ○ 1 shell
+ ○  1 shell
 ```
 
 > Untracked pane gets no line. Tab status = Idle (no tracked panes). ⟦D4 ✓⟧
 
 ## U. Mixed tracked + untracked (one tab)
 
-**Author-from-intent.** One tracked pane (claude running) + one untracked pane (zsh). Only the tracked pane appears; untracked is suppressed. Single-pane path (1 tracked): shows ` └ ⠋ ✳ exploring render` as the child line.
+**Author-from-intent.** One tracked pane (claude running) + one untracked pane (zsh). Only the tracked pane appears; untracked is suppressed. Single-pane path (1 tracked): shows ` └ ⠉⠃ ✳ exploring render` as the child line.
 
 ```rail-input
 width 32
@@ -510,8 +510,8 @@ tab 1 "af"
 ```rail-expect
  RADAR                        ·1
 ◆═══════════════════════════════
- ⠋ 1 af
- └ ⠋ ✳ exploring render
+ ⠉⠃ 1 af
+ └ ⠉⠃ ✳ exploring render
 ```
 
 > Only tracked panes produce pane lines. Untracked (prompt programs, idle shell) are invisible. ⟦D4 ✓⟧
@@ -529,8 +529,8 @@ tab 1 "pinky"
 ```
 ```rail-expect
  RADAR                        ·1
- ⠋ 1 pinky
- └ ⠋ ✳ running tests
+ ⠉⠃ 1 pinky
+ └ ⠉⠃ ✳ running tests
 ```
 
 > Cards density: header is title-only (no `═` rule). Content identical to compact; only the surface bg changes (not visible in the stripped grid).
@@ -549,9 +549,9 @@ tab 1 "af" active
 ```
 ```rail-expect
  RADAR                        ·1
-▌⠋ 1 af
-▌├ ⠋ ❉ exploring render
-▌└ ● ⚙ cargo build
+▌⠉⠃ 1 af
+▌├ ⠉⠃ ❉ exploring render
+▌└ ●  ⚙ cargo build
 ```
 
 > Cards density + active: spine `▌` on all rows; active-child bg path exercised (not visible after ANSI strip). ⟦Cards density⟧
@@ -582,8 +582,8 @@ tab 1 "work"
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ● 1 work
- └ ● ⚙ cargo build
+ ●  1 work
+ └ ●  ⚙ cargo build
 ```
 
 > `exit 0` routes through `command_changed` → `timer` → `panes_changed(exits)` so the
@@ -612,8 +612,8 @@ tab 1 "work"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ✗ 1 work
- └ ✗ ⚙ cargo build exit 1
+ ✗  1 work
+ └ ✗  ⚙ cargo build exit 1
 ```
 
 > `exit 1` → `status = Error`, `exit_code = Some(1)` → `Outcome::Failed(Some(1))` → `exit 1`
@@ -639,10 +639,10 @@ tab 2 "notes"
 ```rail-expect
  RADAR                        ·2
 ◆═══════════════════════════════
- ⠋ 1 web
- └ ⠋ ✳ building
+ ⠉⠃ 1 web
+ └ ⠉⠃ ✳ building
 
- ○ 2 notes
+ ○  2 notes
 ```
 
 > Comfortable density: header rule present; a blank line separates each tab. ⟦Comfortable density⟧
@@ -666,13 +666,13 @@ tab 3 "notes"
 ```
 ```rail-expect
  RADAR                        ·3
- ⠋ 1 web
- └ ⠋ ✳ building
+ ⠉⠃ 1 web
+ └ ⠉⠃ ✳ building
 
- ● 2 worker
- └ ● ✳ shipped
+ ●  2 worker
+ └ ●  ✳ shipped
 
- ○ 3 notes
+ ○  3 notes
 ```
 
 > Cards density: title-only header (no `═`); each card followed by a blank gap row. ⟦Cards density⟧
@@ -695,10 +695,10 @@ tab 1 "review"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ◆ 1 review
- ├ ◆ ✳ migrate schema
+ ◆  1 review
+ ├ ◆  ✳ migrate schema
  │   ↳ approve git push?
- └ ⠋ ❉ write insta tests
+ └ ⠉⠃ ❉ write insta tests
 ```
 
 ## T2 — sticky task: fallback and calm done
@@ -716,9 +716,9 @@ tab 1 "work"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ◆ 1 work
- ├ ◆ ✳ approve?
- └ ● ✳ fix flaky e2e
+ ◆  1 work
+ ├ ◆  ✳ approve?
+ └ ●  ✳ fix flaky e2e
 ```
 
 ## T3 — sticky task: single-pane question line
@@ -736,8 +736,8 @@ tab 1 "review"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ◆ 1 review
- └ ◆ ✳ migrate schema
+ ◆  1 review
+ └ ◆  ✳ migrate schema
      ↳ approve git push?
 ```
 
@@ -757,10 +757,10 @@ tab 1 "release"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ✗ 1 release
- ├ ✗ ✳ fix the deploy
+ ✗  1 release
+ ├ ✗  ✳ fix the deploy
  │   ↳ boom
- └ ⠋ ❉ write insta tests
+ └ ⠉⠃ ❉ write insta tests
 ```
 
 ## T5 — pending wait tag: `· Nm` on the identity line (pending only)
@@ -781,10 +781,10 @@ tab 1 "review"
 ```rail-expect
  RADAR                     ·1 1!
 ════════════════════════════════
- ◆ 1 review
- ├ ◆ ✳ migrate schema · 12m
+ ◆  1 review
+ ├ ◆  ✳ migrate schema · 12m
  │   ↳ approve git push?
- └ ⠋ ❉ write insta tests
+ └ ⠉⠃ ❉ write insta tests
 ```
 
 ---
@@ -794,7 +794,7 @@ tab 1 "review"
 **Render-derived.** The bottom region (spec §9): once a session's content
 leaves ≥2 spare lines, a footer pins to the floor of the pane — a `─` rule and
 the tally line (`{n} working`, gaining ` · {m} need you` only when `m > 0`:
-a zero need-you count is noise, not signal). The `alt-[n] jump` hint is a
+a zero need-you count is noise, not signal). The `Alt-[n] jump` hint is a
 THIRD footer line that renders only under `jump_hint` (the `JumpHint` config —
 same honesty contract as `grant_hint`, but no in-tree config sets it: `run`
 bakes Alt-1..9 → GoToTab binds, yet Alt+digit is commonly claimed upstream of
@@ -820,7 +820,7 @@ ledger 300 error "workspace-ci-runner" "tests failed"
 ```rail-expect
  RADAR                        ·1
 ════════════════════════════════
- ○ 1 web
+ ○  1 web
 ─ earlier ──────────────────────
 1m ● web deploying
 5m ✗ workspace-c… tests failed
@@ -862,7 +862,7 @@ ledger 90 done "web" "deploying"
 
 ────────────────────────────────
 0 working
-alt-[n] jump
+Alt-[n] jump
 ```
 
 > No `tab` line at all — zero rows. The header still renders (·0) because
@@ -870,7 +870,7 @@ alt-[n] jump
 > empty does `render_rail` return nothing, and `PluginRuntime::render` routes
 > to the `onboarding()` scanning face instead (see §A's note above). This
 > scenario also opts into `jump_hint`, so the footer is the full 3 lines —
-> rule, tally, `alt-[n] jump` (column 0, aligned with the tally). No in-tree
+> rule, tally, `Alt-[n] jump` (column 0, aligned with the tally). No in-tree
 > config opts in (see §AB — interception upstream of Zellij makes the chord
 > machine-dependent); the directive keeps the mechanism pinned for users who
 > set `jump_hint "alt-n"` themselves. Without it the hint line simply doesn't
@@ -907,7 +907,7 @@ test; no drift between doc and behavior.
 width <n>            # optional, default 32
 height <n>           # optional, default = enough to fit (no overflow)
 glyphs plain|nerd    # optional, default plain
-jump_hint            # optional; footer advertises `alt-[n] jump` (default hidden)
+jump_hint            # optional; footer advertises `Alt-[n] jump` (default hidden)
 tab <pos> "<name>" [active]
   <kind> <status> "<msg>" [task "<text>"] [waiting <N>m] [exit <N>|?]   # one line per pane, indented
   ...

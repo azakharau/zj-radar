@@ -138,6 +138,11 @@ pub struct Config {
     pub header: bool,
     pub glyphs: crate::status::GlyphSet,
     pub density: Density,
+    /// Render only tracked agent panes in the flat agent rail.
+    pub agents_only: bool,
+    /// Blank rows above the first agent row in the flat rail, so rows sit
+    /// below the pane's very top edge. Ignored outside `agents_only`.
+    pub agents_pad_top: usize,
     pub role: Role,
     /// Which grant escape hatch the needs-permission face advertises.
     pub grant_hint: GrantHint,
@@ -161,6 +166,8 @@ impl Default for Config {
             header: true,
             glyphs: crate::status::GlyphSet::default(),
             density: Density::default(),
+            agents_only: false,
+            agents_pad_top: 0,
             role: Role::default(),
             grant_hint: GrantHint::default(),
             jump_hint: JumpHint::default(),
@@ -180,6 +187,12 @@ fn parse_bool(v: &str) -> Option<bool> {
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Parser for small non-negative line counts (`agents_pad_top`). Clamped to a
+/// sane ceiling so a typo like `300` can't blank the whole rail.
+fn parse_pad(v: &str) -> Option<usize> {
+    v.trim().parse::<usize>().ok().map(|n| n.min(15))
 }
 
 impl NamingMode {
@@ -238,6 +251,8 @@ config_fields! {
     grant_hint: "grant_hint" => GrantHint::from_config,
     jump_hint:  "jump_hint"  => JumpHint::from_config,
     header:              "header"              => parse_bool,
+    agents_only:         "agents_only"         => parse_bool,
+    agents_pad_top:      "agents_pad_top"      => parse_pad,
     defer_permission:    "defer_permission"    => parse_bool,
     notify:              "notify"              => parse_bool,
     notify_done:         "notify_done"         => parse_bool,
@@ -334,6 +349,19 @@ mod tests {
         assert!(Config::from_map(&map(&[("defer_permission", "true")])).defer_permission);
         // garbage → keeps default (false)
         assert!(!Config::from_map(&map(&[("defer_permission", "maybe")])).defer_permission);
+    }
+
+    #[test]
+    fn agents_only_parses_and_defaults_false() {
+        assert!(!Config::default().agents_only);
+        assert!(Config::from_map(&map(&[("agents_only", "true")])).agents_only);
+        assert!(!Config::from_map(&map(&[("agents_only", "maybe")])).agents_only);
+        let mut enabled = Config {
+            agents_only: true,
+            ..Config::default()
+        };
+        enabled.apply_overrides(&map(&[("agents_only", "false")]));
+        assert!(!enabled.agents_only);
     }
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

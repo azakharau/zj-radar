@@ -3349,10 +3349,19 @@ dependencies = [
  "clap 4.6.1",
  "dirs 5.0.1",
  "kdl 6.7.1",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "toml_edit",
+ "zj-radar-core",
+]
+
+[[package]]
+name = "zj-radar-agents"
+version = "0.2.2"
+dependencies = [
+ "zellij-tile",
  "zj-radar-core",
 ]
 

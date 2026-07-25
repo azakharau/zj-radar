@@ -9,7 +9,7 @@
 //! (`RadarState::snapshot_json`/`load_snapshot`); `entries`/`format_age` via
 //! the rail's bottom region (`render::render_bottom` through
 //! `RadarState::ledger_lines`); `any_unsaturated`/`SATURATE_S` via
-//! `PluginRuntime::desired_cadence` (the Slow-vs-disarm cadence pick); and
+//! `PluginRuntime::timer` (the minute-boundary repaint gate); and
 //! `is_empty` via `PluginRuntime::render`'s onboarding-vs-rail choice.
 
 use crate::observation::{ObservationOrigin, TrackedObservation};
@@ -161,7 +161,7 @@ impl Ledger {
         self.entries = sorted.into();
     }
 
-    /// Any entry still younger than SATURATE_S? (Drives the Slow cadence.)
+    /// Any entry still younger than SATURATE_S? Drives minute-boundary repaint.
     pub(crate) fn any_unsaturated(&self, now_epoch_s: u64) -> bool {
         self.entries.iter().any(|e| now_epoch_s.saturating_sub(e.at_epoch_s) < SATURATE_S)
     }
@@ -187,8 +187,7 @@ impl Ledger {
 /// Relative age per the spec §4.4 table. Negative (clock skew) → "<1m".
 ///
 /// The final band starts at SATURATE_S so the rendered age stops changing
-/// exactly when `any_unsaturated` goes false and the Slow timer disarms —
-/// a frozen "1h+" is what makes full disarm safe.
+/// exactly when `any_unsaturated` goes false.
 pub(crate) fn format_age(at_epoch_s: u64, now_epoch_s: u64) -> String {
     let age = now_epoch_s.saturating_sub(at_epoch_s);
     if age < 60 {

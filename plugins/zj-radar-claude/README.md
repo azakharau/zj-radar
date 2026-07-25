@@ -32,11 +32,11 @@ Registers these hooks (all calling the bundled `scripts/notify.sh`):
 | `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStop` | `running` |
 | `Notification` (`permission_prompt` / `elicitation_dialog` matchers) | `pending` |
 | `Stop` | `done` (clears when the pane returns to its shell prompt, or on the next broadcast) |
-| `SessionStart` (`matcher: clear` only) | `idle` (resets the row on `/clear`) |
+| `SessionStart` (`matcher: startup|resume|clear`) | `idle` (announces the pane on startup/resume and resets it on `/clear`; never matches `compact`) |
 | `SessionEnd` | `idle` (clears the row when the Claude session exits) |
 
-Each fires a `zellij pipe --name zj_radar.status.v1` broadcast. It is a **no-op
-outside Zellij**, so it's safe to leave enabled everywhere.
+Each event targets `zellij pipe --name zj_radar.status.v1`,
+which reaches every sidebar instance. It is a **no-op outside Zellij**.
 
 The bundled `notify.sh` requires `jq` and `git` on PATH (to parse the payload and
 derive repo/branch). If the native [`zj-radar`](../../docs/producers.md#codex-and-the-native-cli)

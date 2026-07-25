@@ -66,6 +66,10 @@ fn setup_dry_run_does_not_write_hooks_json() {
     );
     // Verify the file has the expected shape: our marker appears for multiple events
     assert!(
+        after_real.contains("\"SessionStart\""),
+        "hooks.json must contain the SessionStart event"
+    );
+    assert!(
         after_real.contains("\"Stop\""),
         "hooks.json must contain the Stop event"
     );

@@ -21,29 +21,18 @@ use crate::status::{Role, Status};
 use crate::theme::{DerivedColors, Rgb};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod agents;
 mod layout;
 // Layout planning (overflow folding, card spacing, multi-pane expansion) is
 // implementation *behind* the rail seam — only `render.rs` drives it. Import it
 // privately here rather than re-exporting crate-wide so the planning
 // intermediates (`RowMeta`, `plan_layout`, …) can't leak into new callers.
+pub use agents::flat_card_lines;
+use agents::render_agents_only;
 use layout::*;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
-
-/// Ticks a Running pane/tab must sit at the SAME `since_tick` before its
-/// spinner eases from full speed to a slow two-frame blink (see
-/// `spin_glyph`). 600 ticks — the tick-driven render clock isn't wall-clock
-/// 1:1, but at typical UI tick rates this reads as "on the order of minutes".
-/// Honest only because `since_tick` is honest: `StatusStore::apply` preserves
-/// `last_change_tick` across a same-status re-broadcast
-/// (`status_store.rs::apply_sets_last_change_tick_only_on_status_change`) and
-/// `CommandStore` preserves it across a same-command re-promotion
-/// (`promotion_preserves_running_since_for_same_command`,
-/// `crates/core/src/command.rs`) — so a long-runner's `since_tick` reflects
-/// when the work truly started, not the last time it happened to re-announce
-/// itself.
-pub const EASE_AFTER_TICKS: u64 = 600;
 
 /// Most pane lines a multi-pane tab renders before folding the remainder into
 /// a single `+N more` line — the ⟦D6⟧ cap (rail-reference.md: high on
@@ -56,15 +45,19 @@ const MAX_PANE_LINES: usize = 6;
 /// aligned across all child lines (see `child_prefix`'s doc).
 const TREE_PREFIX_COLS: usize = 3;
 
-/// Spinner frame for a Running glyph: full speed normally; after
-/// EASE_AFTER_TICKS a slow two-frame blink (advances every 4th tick) — a
-/// long-runner signals "still going, nothing new" instead of anxiety.
-fn spin_glyph(now_tick: u64, since_tick: u64) -> char {
-    if now_tick.saturating_sub(since_tick) > EASE_AFTER_TICKS {
-        crate::status::working_spin(((now_tick / 4) % 2) as usize)
-    } else {
-        crate::status::working_spin(now_tick as usize)
-    }
+/// Spinner frame for a Running glyph. `now_tick` is the dedicated visual
+/// frame clock, so animation stays smooth without changing domain timing.
+/// Long-running work deliberately keeps the same cadence: elapsed duration
+/// must not make a healthy process look stalled.
+fn spin_glyph(now_tick: u64) -> &'static str {
+    crate::status::working_spin(now_tick as usize)
+}
+
+/// The status glyph slot is a fixed TWO columns: the running spinner is a
+/// 3×4 braille dot grid (two cells); every other glyph pads with a trailing
+/// space so marks and names stay column-aligned across rows.
+fn pad_glyph(c: char) -> String {
+    format!("{c} ")
 }
 
 /// A colored (optionally bold) text run that terminates its own SGR with RESET.
@@ -121,7 +114,7 @@ pub struct RenderOpts {
     /// (`ledger::format_age`). Distinct from `now_tick` (the render/animation
     /// clock) — ages are wall-clock, not tick-relative.
     pub now_epoch_s: u64,
-    /// Whether the footer may advertise the `alt-[n] jump` chord. Zellij owns
+    /// Whether the footer may advertise the `Alt-[n] jump` chord. Zellij owns
     /// keybinds, not the plugin, so this is config-driven honesty (the
     /// `GrantHint` pattern) — and strictly opt-in: NO in-tree config sets it.
     /// Even the `run`-owned config, which bakes the Alt-1..9 → GoToTab binds,
@@ -139,6 +132,13 @@ pub struct RenderOpts {
     /// pre-existing test, and any host that hasn't wired Task 5/6's session
     /// plumbing) renders byte-identical to before this field existed.
     pub badge: Vec<BadgeEntry>,
+    /// Render a flat agent-pane rail instead of the normal tab hierarchy.
+    pub agents_only: bool,
+    pub(crate) agents_offset: usize,
+    /// Blank rows above the first agent row in the flat rail (`agents_only`
+    /// only). Padding lines carry no click target and sit inside the
+    /// offset/height slice, so wheel-scroll consumes them naturally.
+    pub(crate) agents_pad_top: usize,
 }
 
 /// Presentation for the roll-up's `Outcome` tag. The enum itself lives in
@@ -498,8 +498,8 @@ pub fn needs_permission(opts: &RenderOpts, grant_hint: crate::config::GrantHint)
     // rail has no such bind, so it gets the universally true wording (Zellij's
     // own prompt is bound to a rail pane — focus it and answer).
     let hint: [&str; 3] = match grant_hint {
-        crate::config::GrantHint::CtrlY => [" press Ctrl-y to", " open the grant", " prompt."],
-        crate::config::GrantHint::Generic => [" focus this pane;", " press y when the", " prompt appears."],
+        crate::config::GrantHint::CtrlY => [" Press Ctrl-y to", " Open the grant", " Prompt."],
+        crate::config::GrantHint::Generic => [" Focus this pane;", " Press y when the", " Prompt appears."],
     };
     for line in hint {
         push_panel_line(&mut out, muted, line, w);
@@ -527,7 +527,7 @@ fn identity_and_detail<'a>(status: Status, task: &'a str, msg: &'a str) -> (&'a 
 
 /// The `· 12m` wait tag for a pane blocked on the user: whole minutes since
 /// the waiting-on-you edge (`pending_epoch_s`), frozen at `1h+` once saturated
-/// — the same freeze the ledger uses, so the Slow cadence can disarm. `None`
+/// — the same freeze the ledger uses. `None`
 /// under a minute (a fresh ask needs no clock), for every non-Pending status,
 /// and for unstamped rows (pre-upgrade snapshots). Per ⟦D-timer⟧ this lives on
 /// the pane's identity line, never the tab line.
@@ -582,13 +582,11 @@ fn tab_header_line(row: &TabRow, opts: &RenderOpts, tab_target: &RailTarget) -> 
     // never exceeds `width`.
     let pad_x = card_spacing(opts.density).pad_x;
 
-    // col 1: status glyph (working spins; eases to a slow blink for
-    // long-runners — see `spin_glyph`).
+    // col 1: status glyph; working rows use the shared visual frame clock.
     let glyph_char = if st == Status::Running {
-        let since_tick = row.display.detail.as_ref().map(|d| d.since_tick).unwrap_or(now_tick);
-        spin_glyph(now_tick, since_tick)
+        spin_glyph(now_tick).to_string()
     } else {
-        st.glyph_for(opts.glyphs)
+        pad_glyph(st.glyph_for(opts.glyphs))
     };
     // The whole label (glyph + number + name) shares the status color so each
     // row reads as its state at a glance — design: "4 web" is green, "5 infra"
@@ -605,12 +603,13 @@ fn tab_header_line(row: &TabRow, opts: &RenderOpts, tab_target: &RailTarget) -> 
     // cue — the accent spine + brighter card — so the two stay independent.)
     let label_bold = st != Status::Idle;
 
-    // left visible prefix is "X[pad]<glyph> <num> " — bar/glyph are 1 cell each;
+    // left visible prefix is "X[pad]<glyph> <num> " — bar is 1 cell, the
+    // glyph slot is 2 (see `pad_glyph`);
     // `pad_len` is the Cards-only internal left pad (1 col, else 0).
-    // Bare minimum: bar(1, always reserved) + glyph(1) + sp(1) + num. Clamp pad first, then num.
+    // Bare minimum: bar(1, always reserved) + glyph(2) + sp(1) + num. Clamp pad first, then num.
     let num_full = row.number.to_string();
     let bar_width = 1;
-    let bare_min = bar_width + 1 + 1; // bar + glyph + sp (before num)
+    let bare_min = bar_width + 2 + 1; // bar + glyph slot + sp (before num)
     let pad_len = pad_x.min(width.saturating_sub(bare_min + 1)); // keep 1 col for at least '1'
     let num_budget = width.saturating_sub(bare_min + pad_len);
     let num = truncate(&num_full, num_budget);
@@ -881,12 +880,11 @@ fn emit_pane_line(
     let mark_w = UnicodeWidthChar::width(mark).unwrap_or(1);
     let status = pane.render_status();
     let glyph = if status == Status::Running {
-        let since_tick = pane.since_tick().unwrap_or(opts.now_tick);
-        spin_glyph(opts.now_tick, since_tick)
+        spin_glyph(opts.now_tick).to_string()
     } else {
-        status.glyph_for(opts.glyphs)
+        pad_glyph(status.glyph_for(opts.glyphs))
     };
-    let glyph_w = UnicodeWidthChar::width(glyph).unwrap_or(1);
+    let glyph_w = UnicodeWidthStr::width(glyph.as_str());
     // Prefix: the tree prefix (spine/space + connector + space) + glyph + 1 space + mark + 1 space
     let prefix_vis = TREE_PREFIX_COLS + glyph_w + 1 + mark_w + 1;
     prefixed_line(
@@ -912,7 +910,7 @@ fn emit_pane_line(
             let glyph_seg = Seg {
                 color: glyph_color,
                 bold: status != Status::Idle,
-                text: glyph.to_string().into(),
+                text: glyph.clone().into(),
             };
             let mark_seg = Seg::bold(dim_strong, mark.to_string());
             format!(
@@ -1211,12 +1209,9 @@ fn header_rule(width: usize, now_tick: u64, working: bool, accent: &str) -> Stri
 /// card. Renders ZERO lines when `entries.len() <= 1` — only the current
 /// session, or no peer presence has crossed the shared `/cache` root yet —
 /// so the feature is invisible until there's genuinely something
-/// cross-session to show, and
-/// every existing single-session snapshot/test stays byte-identical (the
-/// badge is additive, never a subtraction from the render surface). A lone
-/// fresh own-entry plus only STALE peers still clears this threshold and
-/// renders (task-14: the roster's whole point is remembering) — the count
-/// is over `entries`, not over fresh entries.
+/// cross-session to show, and every existing single-session snapshot/test
+/// stays byte-identical (the badge is additive, never a subtraction from the
+/// render surface).
 ///
 /// The current session's own line carries NO click target at all — you
 /// can't "switch to" the session you're already in, and unlike a peer line
@@ -1225,19 +1220,16 @@ fn header_rule(width: usize, now_tick: u64, working: bool, accent: &str) -> Stri
 /// peer via [`RailTarget::for_session`], which bakes in `tab_position` NOW
 /// (at line-build time, from the entry's `attention_tab_position`) rather
 /// than leaving `mouse_click` to re-derive it later against a badge that may
-/// have moved on by the time the click lands. This applies uniformly to
-/// stale peers too — a click on one is a deliberate act (`entry.stale` only
-/// affects color, never the target).
+/// have moved on by the time the click lands.
 ///
 /// Text is `name` plus, only when nonzero, a running count and an attention
 /// count — each paired with the SAME glyph the per-tab rows already use for
 /// that status (`Status::Running`/`Status::Pending`, run through
 /// `opts.glyphs`) rather than inventing a parallel icon vocabulary the nerd/
 /// plain config wouldn't know about. `selected` (the pending Alt+[/] cycle
-/// target) renders bold+accent; a `stale` entry recedes past the ordinary
-/// muted `idle_text` (see the color derivation below); everything else —
-/// including the current line — renders in `idle_text`, so the badge reads
-/// as a status strip, not a second row of cards.
+/// target) renders bold+accent; everything else — including the current line
+/// — renders in `idle_text`, so the badge reads as a status strip, not a
+/// second row of cards.
 ///
 /// A trailing blank separator line closes the block (live-use feedback: the
 /// badge read as glued to the first card below it without one) — appended
@@ -1256,16 +1248,8 @@ fn render_session_badge(entries: &[BadgeEntry], opts: &RenderOpts) -> Vec<Line> 
     }
     let width = opts.width;
     let idle = tc_fg(opts.theme.idle_text);
-    // A stale entry (task-14: dimmed, never dropped from the badge) recedes
-    // one step further than the ordinary muted `idle_text` every other line
-    // uses — blended halfway toward the panel background, the same "recede
-    // toward bg" idiom `DerivedColors::from_bg_fg` already uses for its own
-    // surface ladder, rather than inventing a parallel dim vocabulary. It
-    // stays fully clickable (`target` below doesn't distinguish stale from
-    // fresh) — a click on it is a deliberate act.
-    let stale = tc_fg(crate::theme::blend(opts.theme.idle_text, opts.theme.rail_bg, 0.5));
     let accent = Role::Accent.ansi();
-    let running_glyph = Status::Running.glyph_for(opts.glyphs);
+    let running_glyph = spin_glyph(opts.now_tick);
     let attention_glyph = Status::Pending.glyph_for(opts.glyphs);
     let mut lines: Vec<Line> = entries
         .iter()
@@ -1290,8 +1274,6 @@ fn render_session_badge(entries: &[BadgeEntry], opts: &RenderOpts) -> Vec<Line> 
                     let clamped = truncate(&label, avail);
                     let label_seg = if entry.selected {
                         Seg::bold(accent, clamped)
-                    } else if entry.stale {
-                        Seg::new(&stale, clamped)
                     } else {
                         Seg::new(&idle, clamped)
                     };
@@ -1432,7 +1414,11 @@ fn render_body(rows: &[TabRow], ledger: &[LedgerLine], opts: &RenderOpts) -> Vec
 /// unbounded-filler branch.
 #[cfg(test)]
 pub(crate) fn body_line_count(rows: &[TabRow], ledger: &[LedgerLine], opts: &RenderOpts) -> usize {
-    render_body(rows, ledger, opts).len()
+    if opts.agents_only {
+        render_agents_only(rows, opts).line_count()
+    } else {
+        render_body(rows, ledger, opts).len()
+    }
 }
 
 /// One filler line: blank, rail-based, click-inert. Shared by the bottom
@@ -1451,13 +1437,13 @@ fn footer_rule(opts: &RenderOpts) -> Line {
     )
 }
 
-/// The footer's bottom hint line: "alt-[n] jump", clamped to width. Starts at
+/// The footer's bottom hint line: "Alt-[n] jump", clamped to width. Starts at
 /// column 0 like the tally above it — a hand-tuned leading space here once put
 /// the two footer lines one column out of step.
 fn footer_hint(opts: &RenderOpts) -> Line {
     let idle = tc_fg(opts.theme.idle_text);
     Line::new(
-        format!("{}\n", Seg::new(&idle, truncate("alt-[n] jump", opts.width))),
+        format!("{}\n", Seg::new(&idle, truncate("Alt-[n] jump", opts.width))),
         None,
         LineBg::Rail,
     )
@@ -1473,10 +1459,17 @@ fn footer_hint(opts: &RenderOpts) -> Line {
 /// width; too-tight-for-both-colors degrades to one run colored by whether the
 /// tally is still loud (`m > 0`).
 fn footer_tally(rows: &[TabRow], opts: &RenderOpts) -> Line {
+    let working = rows
+        .iter()
+        .filter(|r| r.display.status == Status::Running)
+        .count();
+    let need_you = rows.iter().filter(|r| r.display.status.needs_you()).count();
+    footer_tally_counts(working, need_you, opts)
+}
+
+fn footer_tally_counts(working: usize, need_you: usize, opts: &RenderOpts) -> Line {
     let width = opts.width;
     let idle = tc_fg(opts.theme.idle_text);
-    let working = rows.iter().filter(|r| r.display.status == Status::Running).count();
-    let need_you = rows.iter().filter(|r| r.display.status.needs_you()).count();
     if need_you == 0 {
         let text = truncate(&format!("{working} working"), width);
         return Line::new(format!("{}\n", Seg::new(&idle, text)), None, LineBg::Rail);
@@ -1484,8 +1477,6 @@ fn footer_tally(rows: &[TabRow], opts: &RenderOpts) -> Line {
     let left = format!("{working} working · ");
     let right = format!("{} need you", need_you);
     let fits = UnicodeWidthStr::width(left.as_str()) + UnicodeWidthStr::width(right.as_str()) <= width;
-    // `need_you > 0` is guaranteed past the early return, so the loud (bold
-    // attention) form is the only one either branch renders.
     let text = if fits {
         format!("{}{}\n", Seg::new(&idle, left), Seg::bold(Role::Attention.ansi(), right))
     } else {
@@ -1577,7 +1568,7 @@ const LEDGER_DISPLAY_CAP: usize = 10;
 /// spacer … footer rule, tally, hint?). INVARIANT: when it returns any lines,
 /// `flat.len() + returned.len() == opts.height` exactly.
 ///
-/// The footer is `f` lines: rule + tally, plus the `alt-[n] jump` hint line
+/// The footer is `f` lines: rule + tally, plus the `Alt-[n] jump` hint line
 /// only when `opts.jump_hint` claims the chord actually exists (f = 2 or 3).
 /// A shown ledger always ends with one blank spacer line before the footer
 /// rule — history gets air above the pinned floor instead of running into it.
@@ -1635,6 +1626,9 @@ fn render_bottom(rows: &[TabRow], ledger: &[LedgerLine], leftover: usize, opts: 
 }
 
 pub fn render_rail(rows: &[TabRow], ledger: &[LedgerLine], opts: &RenderOpts) -> RenderedRail {
+    if opts.agents_only {
+        return render_agents_only(rows, opts);
+    }
     // Truly nothing to show only when there are no rows AND no ledger history
     // — the caller routes that case to `onboarding` instead (spec §7/§9). Zero
     // rows with a non-empty ledger still renders: header + bottom region, no

@@ -63,12 +63,17 @@ impl StatusStore {
         };
         let ever_active = p.status.is_active() || prev.is_some_and(|s| s.ever_active);
         // Sticky task label: a new prompt replaces it, taskless events (the
-        // overwhelming majority — every tool hook) carry it forward, and idle
-        // (`/clear`) resets it along with the msg.
-        let task = if p.status == crate::status::Status::Idle {
+        // overwhelming majority — every tool hook) carry it forward. A
+        // task-LESS idle (`/clear`) resets it along with the msg, but an idle
+        // that NAMES a task is an identity announcement (the producer-startup
+        // contract: quiet agents exist on the rail before their first work)
+        // and keeps its name.
+        let task = if p.task.is_empty() {
+            if p.status == crate::status::Status::Idle {
             String::new()
-        } else if p.task.is_empty() {
+            } else {
             prev.map(|s| s.task.clone()).unwrap_or_default()
+            }
         } else {
             p.task
         };
@@ -181,6 +186,15 @@ impl StatusStore {
     pub fn cancel_running_suspect(&mut self, pane_id: u32) {
         self.suspect_running.remove(&pane_id);
     }
+    /// Drop the pane's observation entirely — the producer said the agent is
+    /// gone (`gone: true` payload: process exited, remote agent closed). The
+    /// row vanishes instead of lingering as a stale done/idle entry. Returns
+    /// the removed observation so a completion's departure can recede to the
+    /// ledger, mirroring `clear_on_prompt_return`.
+    pub fn remove(&mut self, pane_id: u32) -> Option<TrackedObservation> {
+        self.suspect_running.remove(&pane_id);
+        self.store.remove(pane_id)
+    }
 
     /// Expire grace clocks: any pane still `Running` whose prompt-return
     /// suspicion has outlived the grace window gets cleared to idle — its
@@ -290,6 +304,7 @@ mod tests {
             task: String::new(),
             source: "test".into(),
             ack: false,
+            gone: false,
         }
     }
 
@@ -320,6 +335,18 @@ mod tests {
         s.apply(payload_with_task(1, Status::Running, "old work"), 1, 0);
         s.apply(payload(1, Status::Idle), 2, 0);
         assert_eq!(s.get(1).unwrap().task, "", "idle resets the task");
+    }
+    #[test]
+    fn idle_with_a_task_is_an_identity_announce_and_keeps_it() {
+        // The producer-startup contract: `notify --status idle --task NAME`
+        // puts a quiet agent on the rail under its name — idle resets the
+        // task only when the payload is task-LESS (`/clear`).
+        let mut s = StatusStore::default();
+        s.apply(payload_with_task(1, Status::Idle, "agf"), 1, 0);
+        assert_eq!(s.get(1).unwrap().task, "agf");
+        // A later task-less idle still clears it (the /clear semantics).
+        s.apply(payload(1, Status::Idle), 2, 0);
+        assert_eq!(s.get(1).unwrap().task, "");
     }
 
     #[test]
@@ -568,7 +595,7 @@ mod tests {
         let mut s = StatusStore::default();
         s.apply(payload(1, Status::Pending), 1, 100);
         assert!(!s.get(1).unwrap().acknowledged);
-        // The right-click acknowledge echo lands with `ack: true`.
+        // The pending-row acknowledgement echo lands with `ack: true`.
         s.apply(StatusPayload { ack: true, ..payload(1, Status::Done) }, 2, 200);
         assert!(s.get(1).unwrap().acknowledged);
         // The exemption lasts exactly as long as the acknowledged status: the

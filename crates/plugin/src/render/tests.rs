@@ -57,6 +57,9 @@ fn display(
                 since_tick: d.since_tick,
                 outcome: d.outcome,
                 pending_epoch_s: d.pending_epoch_s,
+                announced: true,
+                ever_active: true,
+                focused: false,
             }]
         })
         .unwrap_or_default();
@@ -122,6 +125,9 @@ fn ro(width: usize, now_tick: u64) -> RenderOpts {
         now_epoch_s: 0,
         jump_hint: true,
         badge: vec![],
+        agents_only: false,
+        agents_offset: 0,
+        agents_pad_top: 0,
     }
 }
 
@@ -461,8 +467,8 @@ fn working_glyph_spins_with_tick() {
     let row = |_t| tab(1, "n", display(Status::Running, 0, 1, Some(d.clone())));
     let f0 = render(&[row(0)], &ro(30, 0));
     let f1 = render(&[row(1)], &ro(30, 1));
-    assert!(f0.contains('⠋'));
-    assert!(f1.contains('⠙'));
+    assert!(f0.contains("⠉⠃"));
+    assert!(f1.contains("⠈⠇"));
 }
 
 #[test]
@@ -946,6 +952,9 @@ fn pe(id: u32, kind: Kind, status: Status, msg: &str) -> PaneDisplay {
         since_tick: 0,
         outcome: None,
         pending_epoch_s: None,
+        announced: true,
+        ever_active: true,
+        focused: false,
     }
 }
 
@@ -960,6 +969,9 @@ fn pe_outcome(id: u32, kind: Kind, status: Status, msg: &str, outcome: Outcome) 
         since_tick: 0,
         outcome: Some(outcome),
         pending_epoch_s: None,
+        announced: true,
+        ever_active: true,
+        focused: false,
     }
 }
 
@@ -974,6 +986,9 @@ fn pe_task(id: u32, kind: Kind, status: Status, msg: &str, task: &str) -> PaneDi
         since_tick: 0,
         outcome: None,
         pending_epoch_s: None,
+        announced: true,
+        ever_active: true,
+        focused: false,
     }
 }
 
@@ -1072,7 +1087,7 @@ fn finished_command_line2_shows_role_colored_tag() {
     let done = render(&[mk(Status::Done, Some(Outcome::Ok), "cargo build")], &ro(30, 0));
     let dline = done.lines().find(|l| l.contains("cargo build")).unwrap();
     assert!(
-        !dline.contains('✓') && strip_sgr(dline).trim() == "└ ● ⚙ cargo build",
+        !dline.contains('✓') && strip_sgr(dline).trim() == "└ ●  ⚙ cargo build",
         "done line carries no tag — the child status glyph is the one done signal: {:?}",
         dline
     );
@@ -1109,7 +1124,7 @@ fn multi_pane_finished_command_shows_outcome_tag() {
 }
 
 #[test]
-fn nerd_set_renders_robot_mark_for_claude() {
+fn nerd_set_renders_vendor_mark_for_claude() {
     let d = pd("r", "b", "thinking", Status::Running);
     let rows = vec![tab(1, "agent", display(Status::Running, 0, 1, Some(d)))];
     let opts = RenderOpts {
@@ -1117,7 +1132,7 @@ fn nerd_set_renders_robot_mark_for_claude() {
         ..ro(30, 0)
     };
     let s = render(&rows, &opts);
-    assert!(s.contains('\u{f06a9}'), "Nerd Claude mark (robot): {:?}", s);
+    assert!(s.contains('\u{ec10}'), "Nerd Claude mark (si-claude vendor logo): {:?}", s);
     assert!(!s.contains('✳'), "plain mark must not appear in Nerd set: {:?}", s);
 }
 
@@ -1159,7 +1174,211 @@ fn display_multi(panes: Vec<PaneDisplay>) -> TabDisplay {
         panes,
     }
 }
+/// The agent you're inside (active tab + focused pane) carries the accent
+/// spine `▌` in col 0 and a bold, undimmed name; every other card keeps the
+/// plain space + dim name. Focus comes from session-wide facts (PaneManifest
+/// + TabUpdate), so the cue is identical on every rail instance.
+#[test]
+fn agents_only_bolds_the_focused_agent() {
+    let focused = PaneDisplay::Tracked {
+        pane_id: 10,
+        kind: Kind::Omp,
+        status: Status::Running,
+        msg: String::new(),
+        task: "internal front title".into(),
+        since_tick: 0,
+        outcome: None,
+        pending_epoch_s: None,
+        announced: true,
+        ever_active: true,
+        focused: true,
+    };
+    let other = pe_task(11, Kind::Codex, Status::Running, "", "internal back title");
+    let rows = vec![
+        TabRow {
+            active: true,
+            ..tab(1, "here", display_multi(vec![focused.clone()]))
+        },
+        tab(2, "elsewhere", display_multi(vec![other])),
+    ];
+    let mut opts = ro(40, 0);
+    opts.agents_only = true;
+    let rail = render_rail(&rows, &[], &opts);
+    let plain = strip_sgr(&rail.ansi);
+    let here_line = plain.lines().find(|l| l.contains("here")).unwrap();
+    let else_line = plain.lines().find(|l| l.contains("elsewhere")).unwrap();
+    assert!(
+        !plain.contains("internal front title") && !plain.contains("internal back title"),
+        "agent-internal titles must not replace Zellij tab names:\n{plain}"
+    );
+    assert!(
+        here_line.starts_with('▌'),
+        "focused agent carries the accent spine: {here_line:?}"
+    );
+    assert!(
+        else_line.starts_with(' '),
+        "unfocused agent keeps the plain gutter: {else_line:?}"
+    );
+    // The focused name is bold and full-brightness (no dim SGR run on it);
+    // check the raw ANSI: bold introducer immediately before "here".
+    let raw = &rail.ansi;
+    let here_idx = raw.find("here").unwrap();
+    let before = &raw[here_idx.saturating_sub(24)..here_idx];
+    assert!(
+        before.contains("\u{1b}[1m"),
+        "focused name renders bold: {before:?}"
+    );
 
+    // Focus on an INACTIVE tab is not "here": no spine anywhere.
+    let rows2 = vec![
+        tab(1, "front", display_multi(vec![focused])),
+        TabRow {
+            active: true,
+            ..tab(
+                2,
+                "back",
+                display_multi(vec![pe(20, Kind::Test, Status::Running, "x")]),
+            )
+        },
+    ];
+    let rail2 = render_rail(&rows2, &[], &opts);
+    let plain2 = strip_sgr(&rail2.ansi);
+    assert!(
+        !plain2.contains('▌'),
+        "focused pane of an inactive tab draws no spine:\n{plain2}"
+    );
+}
+
+#[test]
+fn agents_only_renders_flat_agent_identities() {
+    let rows = vec![
+        TabRow {
+            active: true,
+            ..tab(
+                1,
+                "agent-tab",
+                display_multi(vec![
+                    pe_task(
+                        10,
+                        Kind::Omp,
+                        Status::Pending,
+                        "approve deploy",
+                        "ship release",
+                    ),
+                    pe(11, Kind::OpenCode, Status::Running, "review patch"),
+                    pe(12, Kind::Build, Status::Running, "cargo build"),
+                    PaneDisplay::untracked(13, "shell"),
+                ]),
+            )
+        },
+        tab(
+            2,
+            "task-tab",
+            display_multi(vec![pe(20, Kind::Test, Status::Running, "cargo test")]),
+        ),
+    ];
+    let ledger = vec![LedgerLine {
+        at_epoch_s: 1,
+        error: false,
+        tab_name: "history-tab".into(),
+        label: "old command".into(),
+        tab_position: Some(0),
+    }];
+    let mut opts = ro(60, 0);
+    opts.agents_only = true;
+    opts.badge = vec![
+        badge_entry("work", true, 1, 0, None, false),
+        badge_entry("peer-session", false, 1, 1, Some(2), false),
+    ];
+
+    let rail = render_rail(&rows, &ledger, &opts);
+    let plain = strip_sgr(&rail.ansi);
+
+    assert_eq!(
+        plain,
+        " ◆  ◈ agent-tab\n   approve deploy\n ⠉⠃ ⬡ agent-tab"
+    );
+    assert!(
+        !plain.contains("ship release"),
+        "sticky task must not replace the Zellij tab name in agents_only"
+    );
+    // Pending card grows its attention line (0-1 → pane 10); the running
+    // card is one row (2 → pane 11) — its "review patch" msg is NOT shown:
+    // only needs-attention text earns the second line.
+    let pane10 = RailTarget {
+        tab_position: 0,
+        pane_id: Some(10),
+        session: None,
+    };
+    let pane11 = RailTarget {
+        tab_position: 0,
+        pane_id: Some(11),
+        session: None,
+    };
+    assert_eq!(rail.target_at_line(0), Some(pane10.clone()));
+    assert_eq!(
+        rail.target_at_line(1),
+        Some(pane10),
+        "attention line clicks"
+    );
+    assert_eq!(rail.target_at_line(2), Some(pane11));
+    assert_eq!(rail.target_at_line(3), None);
+    assert!(!plain.contains("working") && !plain.contains("need you") && !plain.contains('─'));
+}
+
+#[test]
+fn agents_only_with_no_agent_panes_is_empty_even_with_history() {
+    let rows = vec![tab(
+        1,
+        "task-tab",
+        display_multi(vec![pe(20, Kind::Build, Status::Running, "cargo build")]),
+    )];
+    let ledger = vec![LedgerLine {
+        at_epoch_s: 1,
+        error: false,
+        tab_name: "history-tab".into(),
+        label: "old command".into(),
+        tab_position: Some(0),
+    }];
+    let opts = RenderOpts {
+        agents_only: true,
+        ..ro(40, 0)
+    };
+
+    assert_eq!(render_rail(&rows, &ledger, &opts), RenderedRail::empty());
+}
+
+#[test]
+fn agents_pad_top_prefixes_blank_click_inert_rows() {
+    let rows = vec![TabRow {
+        active: true,
+        ..tab(
+            1,
+            "agent-tab",
+            display_multi(vec![pe(10, Kind::Omp, Status::Running, "working")]),
+        )
+    }];
+    let mut opts = ro(40, 0);
+    opts.agents_only = true;
+    opts.agents_pad_top = 2;
+
+    let rail = render_rail(&rows, &[], &opts);
+    let plain = strip_sgr(&rail.ansi);
+
+    assert_eq!(plain, "\n\n ⠉⠃ ◈ agent-tab");
+    assert_eq!(rail.target_at_line(0), None, "padding is click-inert");
+    assert_eq!(rail.target_at_line(1), None);
+    let pane10 = RailTarget {
+        tab_position: 0,
+        pane_id: Some(10),
+        session: None,
+    };
+    assert_eq!(rail.target_at_line(2), Some(pane10));
+
+    // Padding alone is still an empty rail: no agents ⇒ nothing renders.
+    let empty = render_rail(&[], &[], &opts);
+    assert_eq!(empty, RenderedRail::empty());
+}
 #[test]
 fn multi_pane_render_row_counts_header_and_children() {
     // New design: 4 tracked panes → 1 header + 4 pane lines = 5 (regardless of active).
@@ -1234,8 +1453,8 @@ fn multi_pane_inactive_fully_collapsed_uses_roster_count_copy() {
     // body[0] = header, body[1] = pane1(Claude/Running x), body[2] = pane2(Codex/Running y)
     // No collapse line — each pane is on its own line.
     assert_eq!(body.len(), 3, "header + 2 pane lines: {:?}", s);
-    assert!(body[1].contains('⠋'), "pane1 shows running glyph: {:?}", body[1]);
-    assert!(body[2].contains('⠋'), "pane2 shows running glyph: {:?}", body[2]);
+    assert!(body[1].contains("⠉⠃"), "pane1 shows running glyph: {:?}", body[1]);
+    assert!(body[2].contains("⠉⠃"), "pane2 shows running glyph: {:?}", body[2]);
     assert!(!s.contains("2 working"), "no collapse line: {:?}", s);
 }
 
@@ -1897,8 +2116,8 @@ fn cards_left_chrome_is_single_column() {
     // Active: the spine in col 0 immediately followed by the glyph at col 1 —
     // no second pad column.
     assert!(
-        active.starts_with("▌⠋"),
-        "active row must be '▌⠋…' (spine+glyph, no pad): {:?}",
+        active.starts_with("▌⠉⠃"),
+        "active row must be '▌⠉⠃…' (spine+glyph, no pad): {:?}",
         active
     );
 }
@@ -1916,11 +2135,11 @@ fn child_line_status_glyph_precedes_spaced_mark() {
     ]);
     let row = TabRow { active: true, ..tab(1, "t", a) };
     let s = render(&[row], &ro_cards(30, 100));
-    // Find the running pane line (active → has spine ▌, contains ⠋ and ✳).
+    // Find the running pane line (active → has spine ▌, contains spinner and ✳).
     let pane_lines: Vec<String> = s
         .lines()
         .map(strip_sgr)
-        .filter(|l| l.contains('⠋') && l.contains('✳'))
+        .filter(|l| l.contains("⠉⠃") && l.contains('✳'))
         .collect();
     assert!(!pane_lines.is_empty(), "running pane line with mark not found");
     let child = &pane_lines[0];
@@ -2861,7 +3080,7 @@ fn footer_pins_to_the_floor_with_exact_height() {
         "line -2 is the tally: {:?}",
         tally
     );
-    assert!(hint.contains("alt-[n] jump"), "line -1 is the hint: {:?}", hint);
+    assert!(hint.contains("Alt-[n] jump"), "line -1 is the hint: {:?}", hint);
 }
 
 #[test]
@@ -2945,7 +3164,7 @@ fn tally_renders_zero_working_and_is_spinner_free() {
     // at any count: the count is the information; motion for "running"
     // belongs to the row glyphs and the header heartbeat.
     assert_eq!(tally.trim(), "0 working");
-    assert!(!tally.contains('⠋'), "tally is spinner-free: {:?}", tally);
+    assert!(!tally.contains("⠉⠃"), "tally is spinner-free: {:?}", tally);
 }
 
 #[test]
@@ -3109,7 +3328,7 @@ fn cards_never_lose_budget_to_the_bottom_region() {
     let rail = render_rail(&rows, &[], &opts);
     assert_eq!(rail.line_count(), 10, "the overflow plan alone fills the pane");
     assert!(
-        !rail.ansi.contains("alt-[n] jump"),
+        !rail.ansi.contains("Alt-[n] jump"),
         "no footer should be squeezed in when there's no room: {:?}",
         rail.ansi
     );
@@ -3190,6 +3409,9 @@ prop_compose! {
                 since_tick: 0,
                 outcome: None,
                 pending_epoch_s: None,
+                announced: true,
+                ever_active: true,
+                focused: false,
             }
         }
     }
@@ -3623,22 +3845,32 @@ fn needs_permission_face_is_distinct_and_actionable() {
     let onboard = onboarding(&opts).ansi;
     let needs = needs_permission(&opts, crate::config::GrantHint::Generic).ansi;
     assert_ne!(needs, onboard, "permission face must differ from idle onboarding");
-    // The searched substrings ("Ctrl-y", "permission", "press y") contain no
+    // The searched substrings ("Ctrl-y", "permission", "Press y") contain no
     // characters that appear in SGR escape sequences (`\x1b`, `[`, digits, `;`,
     // `m`), so a plain `contains` on the raw ANSI string is valid without
     // stripping SGR first.
     //
     // Default (setup-injected rails, unknown installs): NO Ctrl-y promise —
     // that keybind only exists in run-owned configs. The generic wording
-    // (focus + press y) is true everywhere: Zellij binds its native prompt to
+    // (focus + Press y) is true everywhere: Zellij binds its native prompt to
     // a rail pane.
     assert!(!needs.contains("Ctrl-y"), "default face must not promise an uninstalled keybind:\n{needs}");
-    assert!(needs.contains("press y"), "default face must name the universal grant action:\n{needs}");
+    assert!(needs.contains("Press y"), "default face must name the universal grant action:\n{needs}");
+    let generic_plain = strip_sgr(&needs);
+    assert!(
+        generic_plain.ends_with(" Focus this pane;\n Press y when the\n Prompt appears."),
+        "generic hints must begin with uppercase words:\n{generic_plain}"
+    );
     assert!(needs.to_lowercase().contains("permission"), "must mention permission");
 
     // Run-owned configs pass `grant_hint "ctrl-y"` and get the float keybind.
     let ctrl_y = needs_permission(&ro(24, 0), crate::config::GrantHint::CtrlY).ansi;
     assert!(ctrl_y.contains("Ctrl-y"), "run installs must name the grant keybind:\n{ctrl_y}");
+    let ctrl_y_plain = strip_sgr(&ctrl_y);
+    assert!(
+        ctrl_y_plain.ends_with(" Press Ctrl-y to\n Open the grant\n Prompt."),
+        "Ctrl-y hints must begin with uppercase words:\n{ctrl_y_plain}"
+    );
     // Both variants keep the same height: three hint lines behind one face.
     assert_eq!(needs.matches('\n').count(), ctrl_y.matches('\n').count());
 }
@@ -3675,9 +3907,9 @@ fn pending_pane_with_task_renders_identity_plus_question_line() {
     });
     let rendered = render_rail(&[row], &[], &ro_comfortable(32, 40));
     let grid = strip_sgr(&rendered.ansi); // use the file's existing ANSI-strip helper
-    assert!(grid.contains("├ ◆ ✳ migrate schema"), "task is the identity line:\n{grid}");
+    assert!(grid.contains("├ ◆  ✳ migrate schema"), "task is the identity line:\n{grid}");
     assert!(grid.contains("│   ↳ approve git push?"), "question is subordinate:\n{grid}");
-    assert!(grid.contains("└ ⠋ ❉ write tests"), "running pane shows task only:\n{grid}");
+    assert!(grid.contains("└ ⠉⠃ ❉ write tests"), "running pane shows task only:\n{grid}");
     // Lockstep: the ↳ line click-jumps to the pending pane.
     let q_line = grid.lines().position(|l| l.contains('↳')).unwrap();
     assert_eq!(
@@ -3711,73 +3943,48 @@ fn tab_name_column_is_fixed_across_active_and_inactive() {
     assert_eq!(cols[0], cols[1], "active and inactive tab names must start at the same column:\n{ansi}");
 }
 
-// ── Long-runner easing ─────────────────────────────────────────────────────
+// ── Smooth, duration-independent animation ────────────────────────────────
 
 #[test]
-fn spinner_eases_after_ten_minutes() {
-    assert_eq!(spin_glyph(100, 0), crate::status::working_spin(100));
-    let t = EASE_AFTER_TICKS + 100;
-    assert_eq!(spin_glyph(t, 0), crate::status::working_spin(((t / 4) % 2) as usize));
-    assert_ne!(spin_glyph(t, 0), spin_glyph(t + 4, 0), "still blinks — alive, just calm");
-    assert_eq!(spin_glyph(t, 0), spin_glyph(t + 1, 0), "but not every tick");
+fn spinner_advances_on_every_visual_frame() {
+    for frame in 0..40 {
+        assert_ne!(
+            spin_glyph(frame),
+            spin_glyph(frame + 1),
+            "adjacent visual frames must not freeze at frame {frame}"
+        );
+    }
 }
 
 #[test]
-fn spin_glyph_ease_boundary_is_strictly_greater_than() {
-    // The condition is `now_tick.saturating_sub(since_tick) > EASE_AFTER_TICKS`
-    // — strict, not `>=`. So a run exactly EASE_AFTER_TICKS old is still
-    // "younger than" the threshold and gets the full-speed spinner; only the
-    // very next tick crosses into the eased two-frame blink. This pins the
-    // spec's "older than" reading of the threshold, not "at least as old as".
-    assert_eq!(
-        spin_glyph(EASE_AFTER_TICKS, 0),
-        crate::status::working_spin(EASE_AFTER_TICKS as usize),
-        "exactly at the threshold is still full speed"
-    );
-    assert_eq!(
-        spin_glyph(EASE_AFTER_TICKS + 1, 0),
-        crate::status::working_spin((((EASE_AFTER_TICKS + 1) / 4) % 2) as usize),
-        "one tick past the threshold is already eased"
-    );
+fn spinner_frames_keep_a_two_column_slot() {
+    for frame in 0..10 {
+        assert_eq!(
+            visible_width(spin_glyph(frame)),
+            2,
+            "spinner frame {frame} must keep the label column stable"
+        );
+    }
 }
 
 #[test]
-fn running_row_eases_to_slow_blink_after_long_runner_threshold() {
-    // A Running row whose since_tick is far in the past (> EASE_AFTER_TICKS)
-    // must render the eased two-frame blink glyph on line 1, not the
-    // full-speed spinner — a strip_sgr grid check, per the brief.
-    let now = EASE_AFTER_TICKS + 100;
+fn long_running_row_keeps_full_speed_animation() {
+    let frame = 10_000;
     let detail = PrimaryDetail { kind: Kind::Build, ..pd("r", "b", "long build", Status::Running) };
     let row = tab(1, "runner", display(Status::Running, 0, 1, Some(detail)));
-    // `tight` drops the bottom-region footer (whose own tally spinner isn't
-    // eased by this task and would otherwise pollute the full-speed check
-    // below), leaving exactly the header + this row's card lines.
     let rows = [row];
-    let opts = tight(&rows, ro(40, now));
-    let out = render(&rows, &opts);
-    let grid = strip_sgr(&out);
-    let expected = spin_glyph(now, 0);
-    let full_speed = crate::status::working_spin(now as usize);
-    assert_ne!(
-        expected, full_speed,
-        "sanity: the threshold must actually change the glyph at this tick"
-    );
+    let opts = tight(&rows, ro(40, frame));
+    let grid = strip_sgr(&render(&rows, &opts));
     assert!(
-        grid.contains(expected),
-        "eased glyph must appear in the rendered row:\n{grid}"
-    );
-    assert!(
-        !grid.contains(full_speed),
-        "full-speed glyph must not leak through once eased:\n{grid}"
+        grid.contains(crate::status::working_spin(frame as usize)),
+        "running row must render the current visual frame:\n{grid}"
     );
 }
 
 // ── Cross-session badge ─────────────────────────────────────────────────────
 
-/// Local test helper: field order matches `BadgeEntry`'s declaration EXCEPT
-/// `is_current` moves up next to `name` — the shape most test call sites
-/// read naturally ("work, current, 3 running, 0 attention, no attention tab,
-/// not selected, not stale").
+/// Local test helper: field order puts `is_current` next to `name`, the shape
+/// most call sites read naturally.
 fn badge_entry(
     name: &str,
     is_current: bool,
@@ -3786,19 +3993,6 @@ fn badge_entry(
     attention_tab_position: Option<usize>,
     selected: bool,
 ) -> BadgeEntry {
-    stale_badge_entry(name, is_current, running, attention, attention_tab_position, selected, false)
-}
-/// As `badge_entry`, with an explicit trailing `stale` flag — for the
-/// dimmed/clickable/skip-cycle pins.
-fn stale_badge_entry(
-    name: &str,
-    is_current: bool,
-    running: usize,
-    attention: usize,
-    attention_tab_position: Option<usize>,
-    selected: bool,
-    stale: bool,
-) -> BadgeEntry {
     BadgeEntry {
         name: name.to_string(),
         running,
@@ -3806,7 +4000,6 @@ fn stale_badge_entry(
         attention_tab_position,
         is_current,
         selected,
-        stale,
     }
 }
 
@@ -3826,6 +4019,10 @@ fn badge_absent_with_single_session_and_lockstep_with_many() {
     // below it.
     assert_eq!(lines.len(), 3, "2 badge lines + 1 blank separator line");
     assert_eq!(lines[0].target, None, "own session line is not a cross-session click");
+    assert!(
+        strip_sgr(&lines[0].text).contains(crate::status::working_spin(0)),
+        "running count uses the same 3×4 animation as agent rows"
+    );
     let t = lines[1].target.clone().expect("peer line is clickable");
     assert_eq!(t.session.as_deref(), Some("alpha"));
     assert_eq!(t.tab_position, 2);
@@ -3860,85 +4057,5 @@ fn badge_encodes_missing_attention_as_a_sentinel_not_tab_zero() {
     assert_eq!(
         t.session_tab_position(), Some(0),
         "attention genuinely at tab 0 must still resolve to Some(0)"
-    );
-}
-
-// -- Pinning: stale badge entries (task-14) ---------------------------------
-// A remembered session must never silently vanish from the badge; it dims
-// to stale instead. The renderer's job is narrow: paint it in a receded
-// color and keep its click target — `Sessions::cycle` (sessions.rs's own
-// tests) is what actually keeps Alt+[/] from landing on it.
-
-#[test]
-fn stale_badge_entry_renders_dimmed_but_stays_clickable() {
-    let opts = ro(24, 0);
-    let idle_color = tc_fg(opts.theme.idle_text);
-    let stale_color = tc_fg(crate::theme::blend(opts.theme.idle_text, opts.theme.rail_bg, 0.5));
-
-    let entries = vec![
-        badge_entry("work", true, 0, 0, None, false),
-        stale_badge_entry("alpha", false, 0, 0, None, false, true),
-    ];
-    let lines = render_session_badge(&entries, &opts);
-
-    // Still fully clickable — a click on a stale entry is a deliberate act;
-    // `entry.stale` only ever affects color, never the target.
-    let t = lines[1].target.clone().expect("a stale peer line must still be clickable");
-    assert_eq!(t.session.as_deref(), Some("alpha"));
-
-    // Its label paints in the receded stale color, not the ordinary muted
-    // idle_text every fresh line uses.
-    assert!(
-        lines[1].text.contains(&format!("{stale_color}alpha")),
-        "stale label must render in the receded stale color, got {:?}",
-        lines[1].text
-    );
-    assert!(
-        !lines[1].text.contains(&format!("{idle_color}alpha")),
-        "stale label must not render in the plain idle color, got {:?}",
-        lines[1].text
-    );
-}
-
-#[test]
-fn stale_entry_undims_once_superseded_by_a_fresh_entry() {
-    // The recreation case: the exact same name, now reported fresh, must
-    // render in the ordinary idle color again — nothing about a name alone
-    // pins a line to stale forever.
-    let opts = ro(24, 0);
-    let idle_color = tc_fg(opts.theme.idle_text);
-    let stale_color = tc_fg(crate::theme::blend(opts.theme.idle_text, opts.theme.rail_bg, 0.5));
-
-    let stale_entries = vec![
-        badge_entry("work", true, 0, 0, None, false),
-        stale_badge_entry("alpha", false, 0, 0, None, false, true),
-    ];
-    let stale_lines = render_session_badge(&stale_entries, &opts);
-    assert!(stale_lines[1].text.contains(&format!("{stale_color}alpha")));
-
-    let fresh_entries = vec![
-        badge_entry("work", true, 0, 0, None, false),
-        badge_entry("alpha", false, 0, 0, None, false), // same name, now fresh
-    ];
-    let fresh_lines = render_session_badge(&fresh_entries, &opts);
-    assert!(
-        fresh_lines[1].text.contains(&format!("{idle_color}alpha")),
-        "a superseding fresh presence must undim the line back to the plain idle color"
-    );
-    assert!(!fresh_lines[1].text.contains(&format!("{stale_color}alpha")));
-}
-
-#[test]
-fn lone_fresh_own_entry_with_only_stale_peers_still_renders() {
-    // The single-session zero-line rule counts `entries.len()`, not fresh
-    // entries — a stale peer still counts toward the 2+ threshold, since the
-    // roster's whole point is remembering (task-14).
-    let entries = vec![
-        badge_entry("work", true, 0, 0, None, false),
-        stale_badge_entry("alpha", false, 0, 0, None, false, true),
-    ];
-    assert!(
-        !render_session_badge(&entries, &ro(24, 0)).is_empty(),
-        "a lone fresh own-entry plus only stale peers must still render the badge"
     );
 }

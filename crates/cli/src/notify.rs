@@ -11,7 +11,7 @@ use std::process::Command;
 
 /// Terminal pane id from `$ZELLIJ_PANE_ID` (strip a `terminal_` prefix), or None
 /// when not running under Zellij or the id is non-numeric.
-fn pane_id_from_env() -> Option<u32> {
+pub(crate) fn pane_id_from_env() -> Option<u32> {
     std::env::var_os("ZELLIJ")?; // not under Zellij → no-op
     let raw = std::env::var("ZELLIJ_PANE_ID").ok()?;
     raw.strip_prefix("terminal_")
@@ -181,14 +181,29 @@ pub fn run_generic(
     msg: Option<&str>,
     task: Option<&str>,
     source: Option<&str>,
+    gone: bool,
     dry_run: bool,
 ) {
     let Some(pane_id) = pane_id_or_dry_run_hint(dry_run) else {
         return;
     };
+    if gone {
+        // The agent behind this pane exited: broadcast a removal. Status is
+        // pinned to `idle` so an old plugin (no `gone` support) degrades to a
+        // plain idle row instead of misreading the payload.
+        let payload = to_wire(&StatusPayload {
+            pane_id,
+            status: Status::Idle,
+            source: source.unwrap_or("generic").to_string(),
+            gone: true,
+            ..StatusPayload::default()
+        });
+        send_payload(payload, dry_run);
+        return;
+    }
     let Some(update) = generic_update(status, msg, task) else {
         eprintln!(
-            "zj-radar: notify generic needs --status <{}> (plus optional --msg, --task, --source)",
+            "zj-radar: notify generic needs --status <{}> (plus optional --msg, --task, --source, --gone)",
             wire_vocabulary()
         );
         return;
@@ -256,14 +271,30 @@ fn broadcast(pane_id: u32, update: AgentUpdate, source: &str, dry_run: bool) {
         task,
         source: source.to_string(),
         ack: false,
+        gone: false,
     });
+    send_payload(payload, dry_run);
+}
 
+/// The send tail shared by `broadcast` and the `--gone` removal: print under
+/// `--dry-run`; otherwise persist/push the session relay copy before the
+/// ordinary local Zellij broadcast.
+fn send_payload(payload: String, dry_run: bool) {
     if dry_run {
         // Machine-readable output goes to stdout (same rule as `run
         // --print-cmd`): `notify … --dry-run | jq` must capture the payload.
         println!("{payload}");
         return;
     }
+    crate::relay::record_from_env(&payload);
+    send_local_payload(payload);
+}
+
+/// Broadcast a payload only to this Zellij session. The remote bridge uses
+/// this after rewriting a remote pane id to its real local parent; keeping the
+/// relay tap out of this path prevents the aggregate from feeding back into a
+/// second persisted relay observation.
+pub(crate) fn send_local_payload(payload: String) {
     // Bounded send. `zellij pipe` blocks until every loaded plugin instance
     // consumes the message (CLI-pipe backpressure) — a rail wedged at the
     // permission prompt blocks it forever, and hooks fire per tool call, so an

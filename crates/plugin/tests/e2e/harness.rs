@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "e2e")]
 pub struct ZellijSession {
     pub name: String,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     _reader: std::thread::JoinHandle<()>,
     buf: Arc<Mutex<Vec<u8>>>,
@@ -228,7 +228,7 @@ impl ZellijSession {
 
         let s = ZellijSession {
             name: name.into(),
-            _child: child,
+            _child: Mutex::new(child),
             pty_writer,
             _reader,
             buf,
@@ -256,6 +256,8 @@ impl ZellijSession {
             std::thread::sleep(Duration::from_millis(400));
             let text = self.pty_text();
 
+            self.panic_if_child_exited("before the plugin rendered");
+
             // Handle permission prompt (fallback if permissions.kdl wasn't read).
             if !perm_sent
                 && (text.contains("Grant")
@@ -282,16 +284,33 @@ impl ZellijSession {
         panic!(
             "zellij session '{}' never showed plugin header; PTY tail:\n{}",
             self.name,
-            &self
-                .pty_text()
+            self.pty_tail()
+        );
+    }
+
+    fn pty_tail(&self) -> String {
+        self.pty_text()
                 .chars()
                 .rev()
                 .take(200)
                 .collect::<String>()
                 .chars()
                 .rev()
-                .collect::<String>()
+            .collect()
+    }
+
+    fn panic_if_child_exited(&self, phase: &str) {
+        let status = {
+            let mut child = self._child.lock().unwrap();
+            child.try_wait()
+        };
+        if let Ok(Some(status)) = status {
+            panic!(
+                "zellij session '{}' exited {phase} ({status}); PTY tail:\n{}",
+                self.name,
+                self.pty_tail()
         );
+    }
     }
 
     /// Discover the terminal pane's `ZELLIJ_PANE_ID` by injecting a shell
@@ -476,7 +495,8 @@ impl ZellijSession {
     }
 
     /// Poll `cond` against this session until it holds or `timeout` elapses,
-    /// re-checking every 150ms. Returns whether it became true. Prefer this over
+    /// re-checking every 150ms. Panics immediately with the child status and PTY
+    /// tail if Zellij exits. Returns whether the condition became true. Prefer this over
     /// a fixed `sleep` before an assertion: a fast machine returns the instant
     /// the frame is ready, while a loaded CI runner gets the full budget. The
     /// dominant source of E2E flake is a fixed sleep that under-waits, so the
@@ -486,6 +506,7 @@ impl ZellijSession {
     pub fn wait_until(&self, timeout: Duration, mut cond: impl FnMut(&Self) -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
+            self.panic_if_child_exited("while waiting for an E2E condition");
             if cond(self) {
                 return true;
             }
@@ -678,10 +699,14 @@ fn regex_capture_u32(marker: &str, haystack: &str) -> Option<u32> {
 
 // ── Public fixtures ─────────────────────────────────────────────────────────
 
-/// Absolute path to the built wasm plugin.
-/// The caller must build it first (via `cargo build --release --target wasm32-wasip1`).
+/// Absolute path to the built wasm plugin. `ZJ_RADAR_E2E_WASM` overrides the
+/// workspace target path so an isolated `CARGO_TARGET_DIR` cannot silently test
+/// a stale artifact.
 #[cfg(feature = "e2e")]
 pub fn plugin_wasm_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("ZJ_RADAR_E2E_WASM") {
+        return path.into();
+    }
     // In a virtual workspace every member shares the workspace-root target dir,
     // so `cargo build -p zj-radar-plugin` writes here, not under crates/plugin.
     // CARGO_MANIFEST_DIR is the crate dir (crates/plugin); go up two levels.

@@ -2,20 +2,20 @@
 # zj-radar Claude Code plugin notifier.
 #
 # Registered by the bundled hooks/hooks.json; called as `notify.sh <status>`
-# where <status> is running | pending | done (the hook event determines which).
+# where <status> is running | pending | done | idle (the hook event determines which).
 # Reads the Claude hook JSON on stdin for cwd + last message, then broadcasts a
-# zj_radar.status.v1 message to the zj-radar Zellij sidebar.
+# zj_radar.status.v1 message to every zj-radar sidebar instance.
 #
 # Design contract (matches the sidebar plugin's pipe schema):
-#   - BROADCAST by name (never --plugin): reaches every sidebar instance and
-#     never force-launches a plugin if the sidebar isn't loaded.
+#   - Broadcast by pipe name to every existing sidebar instance without
+#     launching a plugin or waiting on unrelated plugins.
 #   - In-order and non-erroring: the pipe is sent synchronously (hooks fire in
 #     order, so the producer must not reorder its own broadcasts) and every
 #     failure path degrades to a silent no-op — never an error into Claude.
 #   - No-op outside Zellij, or on a non-terminal pane id.
 #
-# Dependency: jq (used to parse the hook payload + build JSON). The productized
-# `zj-radar notify` binary will remove this dependency.
+# Fallback dependency: jq parses and builds JSON only when the native
+# `zj-radar notify` binary is unavailable.
 set -euo pipefail
 
 status="${1:-running}"
@@ -253,17 +253,12 @@ fi
 # producer is what makes the plugin's latest-wins contract hold. An earlier
 # version backgrounded this with `( … ) &`, which let a Stop→done pipe be
 # overtaken by the preceding PostToolUse→running — the stale spinner stuck
-# until the next event. `zellij pipe` is a fast local write; `|| true` keeps
-# a dead/absent server from erroring into Claude.
-#
-# …but bounded: a rail instance wedged at Zellij's permission prompt blocks
-# `zellij pipe` forever (backpressure — the client is held until every plugin
-# consumes the message), and hooks fire per tool call, so unbounded blocked
-# clients each pin two server FDs until the server EMFILEs and the session
-# crashes. A watchdog caps the wait; killing the client never retracts the
-# message (it is already queued server-side), so ordering still holds — sends
-# stay sequential and an expired send was going nowhere anyway. GNU `timeout`
-# isn't on stock macOS, hence the hand-rolled sleep+kill pair.
+# until the next event. A name-only `zellij pipe` reaches every running
+# sidebar instance while excluding unrelated plugins; the watchdog remains as
+# a backstop for a radar instance wedged at its own permission prompt.
+# Killing the client never retracts a queued message, so sends stay sequential
+# and an expired send was going nowhere anyway. GNU `timeout` isn't on stock
+# macOS, hence the hand-rolled sleep+kill pair.
 pipe_deadline="${ZJ_RADAR_PIPE_TIMEOUT:-5}"
 # Fail CLOSED on a malformed override: the watchdog subshell inherits `set -e`,
 # so a value `sleep` rejects would kill it before the `kill` line runs and the

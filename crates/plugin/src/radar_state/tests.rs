@@ -55,10 +55,9 @@ fn command_changed_to_shell_does_not_clear_a_running_status() {
 }
 
 #[test]
-fn pending_wait_drives_the_slow_cadence_until_saturation() {
-    // The `· Nm` wait tag advances at minute granularity, so an unsaturated
-    // pending row must keep the Slow heartbeat armed — and release it once
-    // the tag freezes at 1h+ (same window the ledger uses).
+fn pending_wait_is_unsaturated_until_the_age_label_freezes() {
+    // The `· Nm` wait tag advances at minute granularity until it freezes at
+    // 1h+, using the same saturation window as the ledger.
     let mut radar = RadarState::default();
     radar
         .status_mut()
@@ -92,16 +91,16 @@ fn killed_agent_running_row_expires_via_the_timer() {
 }
 
 #[test]
-fn agent_foreground_cancels_a_prompt_return_suspect() {
-    // A mid-turn flicker: shell shows through, then the agent's exe is the
-    // foreground again. The grace clock must cancel — a live turn is never
-    // cleared no matter how long it runs.
+fn omp_foreground_cancels_a_prompt_return_suspect() {
+    // A mid-turn flicker: shell shows through, then OMP itself is foreground
+    // again. The grace clock must cancel even though OMP is not in AGENT_NAMES
+    // and remains eligible for ordinary command tracking when no push arrives.
     let mut radar = RadarState::default();
-    radar
-        .status_mut()
-        .apply(payload_in_repo(7, Status::Running, "pinky"), 1, 0);
+    let mut payload = payload_in_repo(7, Status::Running, "pinky");
+    payload.source = "omp".into();
+    radar.status_mut().apply(payload, 1, 0);
     radar.command_changed(7, &["bash".into()], true, 5);
-    radar.command_changed(7, &["claude".into()], true, 6);
+    radar.command_changed(7, &["omp".into()], true, 6);
     for t in 7..(7 + crate::status_store::RUNNING_SUSPECT_GRACE_TICKS * 2) {
         radar.timer(t, 0);
     }
@@ -288,6 +287,288 @@ fn pane_update(tab_panes: HashMap<usize, Vec<TerminalPane>>) -> PaneUpdate {
 }
 
 #[test]
+fn push_owned_pane_ignores_foreground_children() {
+    let mut radar = RadarState::default();
+
+    // Simulate stale command-origin state loaded before topology arrives.
+    radar.command_changed(7, &["cargo".into(), "test".into()], true, 1);
+    radar.timer(1 + DEBOUNCE_TICKS, 0);
+    assert!(radar.command(7).is_some());
+
+    let mut owner = pane(7);
+    owner.push_owned = true;
+    let change = radar.panes_changed(
+        pane_update(HashMap::from([(0, vec![owner])])),
+        4,
+        0,
+        config::NamingMode::Off,
+    );
+    assert!(change.persist_snapshot);
+    assert!(radar.command(7).is_none());
+
+    // A remote agent can leave a long-lived subprocess in the foreground while
+    // the bridge is idle. That child is not independent local command work.
+    radar.command_changed(
+        7,
+        &["python".into(), "code-review-graph".into(), "serve".into()],
+        true,
+        5,
+    );
+    radar.timer(5 + DEBOUNCE_TICKS, 0);
+    assert!(radar.command(7).is_none());
+
+    // Nor may a child-process shell edge expire status owned by the root
+    // producer; its hook or PaneUpdate close owns that lifecycle.
+    radar
+        .status_mut()
+        .apply(payload_in_repo(7, Status::Running, "omp"), 6, 0);
+    radar.command_changed(7, &["zsh".into()], true, 7);
+    radar.timer(100, 0);
+    assert_eq!(radar.status(7).unwrap().status, Status::Running);
+}
+
+#[test]
+fn shell_launched_remote_bridge_stays_idle_during_child_until_status_arrives() {
+    let mut radar = RadarState::default();
+
+    // Shell-launched panes have no root terminal_command. Seeing the bridge is
+    // enough to make its persistent foreground children status-owned.
+    radar.command_changed(
+        7,
+        &["zj-radar".into(), "remote".into(), "agent-pc".into(), "agf".into()],
+        true,
+        1,
+    );
+    radar.command_changed(
+        7,
+        &["python".into(), "code-review-graph".into(), "serve".into()],
+        true,
+        2,
+    );
+    radar.timer(2 + DEBOUNCE_TICKS, 0);
+    assert!(radar.command(7).is_none());
+    assert!(radar.status(7).is_none());
+
+    let mut running = payload_in_repo(7, Status::Running, "omp");
+    running.source = "omp".into();
+    radar
+        .status_pipe(
+            &crate::payload::to_wire(&running),
+            5,
+            100,
+            config::NamingMode::Off,
+        )
+        .expect("valid OMP running payload");
+    radar.command_changed(
+        7,
+        &["python".into(), "code-review-graph".into(), "serve".into()],
+        true,
+        6,
+    );
+
+    let mut done = running;
+    done.status = Status::Done;
+    radar
+        .status_pipe(
+            &crate::payload::to_wire(&done),
+            7,
+            101,
+            config::NamingMode::Off,
+        )
+        .expect("valid OMP done payload");
+    radar.command_changed(
+        7,
+        &["python".into(), "code-review-graph".into(), "serve".into()],
+        true,
+        8,
+    );
+    radar.timer(8 + DEBOUNCE_TICKS, 102);
+
+    let observation = radar.status(7).expect("OMP status remains authoritative");
+    assert_eq!(observation.status, Status::Done);
+    assert_eq!(observation.origin, ObservationOrigin::StatusPipe);
+    assert!(radar.command(7).is_none());
+}
+
+#[test]
+fn shell_launched_ownership_survives_one_manifest_absence_before_first_status() {
+    let mut radar = RadarState::default();
+    radar.command_changed(
+        7,
+        &["zj-radar".into(), "remote".into(), "agent-pc".into(), "agf".into()],
+        true,
+        1,
+    );
+    radar.panes_changed(
+        pane_update(HashMap::from([(0, vec![pane(7)])])),
+        2,
+        0,
+        config::NamingMode::Off,
+    );
+
+    // Break-pane reports one transient empty manifest before the corrective
+    // topology. terminal_command is still null when pane 7 returns.
+    radar.panes_changed(pane_update(HashMap::new()), 3, 0, config::NamingMode::Off);
+    radar.panes_changed(
+        pane_update(HashMap::from([(1, vec![pane(7)])])),
+        4,
+        0,
+        config::NamingMode::Off,
+    );
+    radar.command_changed(
+        7,
+        &["python".into(), "code-review-graph".into(), "serve".into()],
+        true,
+        5,
+    );
+    radar.timer(5 + DEBOUNCE_TICKS, 0);
+
+    assert!(radar.command(7).is_none());
+    assert!(radar.status(7).is_none());
+}
+
+#[test]
+fn child_shell_commands_do_not_release_shell_launched_remote_ownership() {
+    let mut radar = RadarState::default();
+    radar.command_changed(
+        7,
+        &["zj-radar".into(), "remote".into(), "agent-pc".into(), "agf".into()],
+        true,
+        0,
+    );
+    let mut done = payload_in_repo(7, Status::Done, "omp");
+    done.source = "omp".into();
+    radar
+        .status_pipe(
+            &crate::payload::to_wire(&done),
+            1,
+            100,
+            config::NamingMode::Off,
+        )
+        .expect("valid OMP payload");
+
+    radar.command_changed(
+        7,
+        &["zsh".into(), "-c".into(), "cargo test".into()],
+        true,
+        2,
+    );
+    radar.command_changed(
+        7,
+        &["sh".into(), "-c".into(), "cargo build".into()],
+        true,
+        3,
+    );
+    radar.command_changed(7, &["starship".into()], true, 4);
+    radar.command_changed(7, &["cargo".into(), "test".into()], true, 5);
+    radar.timer(5 + DEBOUNCE_TICKS, 101);
+
+    assert_eq!(radar.status(7).unwrap().status, Status::Done);
+    assert!(radar.command(7).is_none());
+}
+
+#[test]
+fn bare_parent_shell_releases_shell_launched_ownership_for_later_commands() {
+    let mut radar = RadarState::default();
+    radar.command_changed(
+        7,
+        &["zj-radar".into(), "remote".into(), "agent-pc".into(), "agf".into()],
+        true,
+        1,
+    );
+
+    radar.command_changed(7, &["zsh".into()], true, 2);
+    radar.command_changed(7, &["cargo".into(), "test".into()], true, 3);
+    radar.timer(3 + DEBOUNCE_TICKS, 0);
+
+    let command = radar.command(7).expect("later shell command is tracked");
+    assert_eq!(command.status, Status::Running);
+    assert_eq!(command.origin, ObservationOrigin::Command);
+}
+
+#[test]
+fn snapshot_restores_omp_ownership_before_child_command_events() {
+    let mut source = RadarState::default();
+    source.command_changed(7, &["cargo".into(), "test".into()], true, 1);
+    source.timer(1 + DEBOUNCE_TICKS, 0);
+    assert!(source.command(7).is_some());
+
+    // Model a merged shared snapshot carrying an older command observation
+    // beside the newer OMP status for the same pane.
+    let mut pushed = payload_in_repo(7, Status::Done, "omp");
+    pushed.source = "omp".into();
+    source.status_mut().apply(pushed, 4, 100);
+    let snapshot = source.snapshot_json(None, 4);
+
+    let mut restored = RadarState::default();
+    restored.load_snapshot(&snapshot).expect("valid snapshot");
+    assert!(restored.command(7).is_none());
+
+    restored.command_changed(
+        7,
+        &["python".into(), "code-review-graph".into(), "serve".into()],
+        true,
+        5,
+    );
+    restored.timer(5 + DEBOUNCE_TICKS, 101);
+
+    assert!(restored.command(7).is_none());
+    assert_eq!(restored.status(7).unwrap().status, Status::Done);
+}
+
+#[test]
+fn panes_changed_clears_stale_commands_from_every_root_owned_pane() {
+    let mut radar = RadarState::default();
+    for pane_id in [7, 8] {
+        radar.command_changed(pane_id, &["cargo".into(), "test".into()], true, 1);
+    }
+    radar.timer(1 + DEBOUNCE_TICKS, 0);
+    assert!(radar.command(7).is_some());
+    assert!(radar.command(8).is_some());
+
+    let mut first = pane(7);
+    first.push_owned = true;
+    let mut second = pane(8);
+    second.push_owned = true;
+    let change = radar.panes_changed(
+        pane_update(HashMap::from([(0, vec![first, second])])),
+        4,
+        0,
+        config::NamingMode::Off,
+    );
+
+    assert!(change.persist_snapshot);
+    assert!(radar.command(7).is_none());
+    assert!(radar.command(8).is_none());
+}
+
+#[test]
+fn direct_root_push_owned_exit_does_not_create_command_completion() {
+    let mut radar = RadarState::default();
+    let mut done = payload_in_repo(7, Status::Done, "omp");
+    done.source = "omp".into();
+    radar
+        .status_pipe(
+            &crate::payload::to_wire(&done),
+            1,
+            99,
+            config::NamingMode::Off,
+        )
+        .expect("valid OMP payload");
+    let mut owner = pane(7);
+    owner.push_owned = true;
+    let mut update = pane_update(HashMap::from([(0, vec![owner])]));
+    update.exits.push((7, Some(0)));
+
+    radar.panes_changed(update, 2, 100, config::NamingMode::Off);
+
+    assert!(radar.command(7).is_none());
+    let observation = radar.status(7).expect("status-pipe completion remains");
+    assert_eq!(observation.status, Status::Done);
+    assert_eq!(observation.origin, ObservationOrigin::StatusPipe);
+}
+
+#[test]
 fn panes_changed_requests_cwd_bootstrap_for_new_pane_without_cwd() {
     let mut radar = RadarState::default();
     radar.tabs_changed(vec![tab(10, 0, "Tab #1", true)]);
@@ -377,6 +658,7 @@ fn panes_changed_persists_only_on_exit_displace_or_prune() {
         id: 7,
         title: "retitled".into(),
         focused_in_tab: true,
+        push_owned: false,
     };
     let change = radar.panes_changed(
         pane_update(HashMap::from([(0, vec![retitled])])),
@@ -579,6 +861,10 @@ fn bootstrapped_cwd_names_the_tab_and_later_cd_still_renames() {
     );
     assert_eq!(opened.cwd_bootstrap, vec![7]);
 
+    // The topology-settle gate holds renames for one timer period after the
+    // tab set changed (the new-tab-next-to-current cascade guard); tick past it.
+    radar.timer(1, 0);
+
     // 2. Host resolves it; the tab is named from the spawn directory.
     let bootstrapped = radar.cwd_changed(7, "/work/alpha".into(), config::NamingMode::Managed);
     assert_eq!(
@@ -609,6 +895,62 @@ fn bootstrapped_cwd_names_the_tab_and_later_cd_still_renames() {
     );
 }
 
+/// The new-tab-next-to-current cascade: a tab inserted mid-list shifts every
+/// tab after it, and until BOTH the TabUpdate and the PaneUpdate land, the
+/// position-keyed tabs×panes join reads the neighbor's panes — naming must
+/// stay silent through the churn window instead of durably renaming tab B
+/// after the new tab's directory.
+#[test]
+fn tab_insert_churn_window_emits_no_renames() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "alpha", true), tab(20, 1, "beta", false)]);
+    radar.set_tab_panes_for_position(0, vec![focused_pane(1)]);
+    radar.set_tab_panes_for_position(1, vec![focused_pane(2)]);
+    radar.cwd_changed(1, "/work/alpha".into(), config::NamingMode::Force);
+    radar.timer(1, 0);
+    radar.cwd_changed(2, "/work/beta".into(), config::NamingMode::Force);
+
+    // New tab 30 inserted at position 1 (next-to-current): beta shifts to 2.
+    // The manifest with the NEW keying arrives while `tabs` is still the old
+    // two-tab set — position 1 now holds the new tab's pane, and a key (2)
+    // exists that no known tab holds.
+    let churn = radar.panes_changed(
+        pane_update(HashMap::from([
+            (0, vec![focused_pane(1)]),
+            (1, vec![focused_pane(9)]),
+            (2, vec![focused_pane(2)]),
+        ])),
+        2,
+        0,
+        config::NamingMode::Force,
+    );
+    assert_eq!(churn.renames, vec![], "mid-churn join must not rename");
+
+    // The TabUpdate lands (mapping changed → still settling this tick)…
+    radar.tabs_changed(vec![
+        tab(10, 0, "alpha", true),
+        tab(30, 1, "Tab #2", false),
+        tab(20, 2, "beta", false),
+    ]);
+    let still_settling = radar.cwd_changed(9, "/work/newtab".into(), config::NamingMode::Force);
+    assert_eq!(
+        still_settling.renames,
+        vec![],
+        "same-tick renames stay gated"
+    );
+
+    // …the next timer tick settles the topology; the consistent join names
+    // ONLY the new tab, and beta keeps its own name.
+    radar.timer(3, 0);
+    let settled = radar.cwd_changed(9, "/work/newtab2".into(), config::NamingMode::Force);
+    assert_eq!(
+        settled.renames,
+        vec![TabRename {
+            position: 1,
+            name: "newtab2".into(),
+        }]
+    );
+}
 // The pure roll-up behaviours — untracked panes shown-but-not-counted,
 // severity precedence, tie-break, done/total/pending counts, and the
 // command-only outcome mapping — are tested directly against `roll_up` in
@@ -1285,6 +1627,7 @@ proptest! {
                                 // focus id isn't present the reading is None — so the
                                 // sequence also exercises focus bounces off a terminal.
                                 focused_in_tab: Some(id) == *focus,
+                                push_owned: false,
                             })
                             .collect();
                         tab_panes.insert(*pos, panes);
@@ -1455,6 +1798,7 @@ fn raw_pane(id: u32, tab_pos: usize) -> RawPane {
         default_fg: None,
         exited: false,
         exit_status: None,
+        terminal_command: None,
     }
 }
 
@@ -1468,6 +1812,23 @@ fn from_raw_skips_plugin_panes() {
     assert_eq!(update.live, HashSet::from([2]));
     assert_eq!(update.tab_panes[&0].len(), 1);
     assert_eq!(update.tab_panes[&0][0].id, 2);
+}
+
+#[test]
+fn from_raw_marks_push_owned_root_processes() {
+    let update = PaneUpdate::from_raw(vec![
+        RawPane {
+            terminal_command: Some("/Users/me/.local/bin/zj-radar remote agent-pc agf".into()),
+            ..raw_pane(1, 0)
+        },
+        RawPane {
+            terminal_command: Some("/opt/homebrew/bin/omp --resume".into()),
+            ..raw_pane(2, 0)
+        },
+    ]);
+
+    assert!(update.tab_panes[&0][0].push_owned);
+    assert!(!update.tab_panes[&0][1].push_owned);
 }
 
 #[test]
@@ -1609,6 +1970,47 @@ fn prompt_return_clear_ledgers_the_agent_completion() {
         lines[0].at_epoch_s, 100,
         "the completion's own stamp survives — command_changed takes no clock at all"
     );
+}
+#[test]
+fn gone_payload_removes_the_observation_and_ledgers_a_departing_completion() {
+    let mut radar = RadarState::default();
+    radar.tabs_changed(vec![tab(10, 0, "work", true)]);
+    radar.set_tab_panes_for_position(0, vec![pane(7)]);
+
+    let wire = payload::to_wire(&StatusPayload {
+        msg: "shipped it".into(),
+        ..payload_in_repo(7, Status::Done, "pinky")
+    });
+    radar.status_pipe(&wire, 1, 100, config::NamingMode::Off);
+    assert_eq!(radar.status(7).unwrap().status, Status::Done);
+
+    // The producer says the agent exited: the observation is DROPPED, not
+    // idled — no residual row, and the completion recedes to the ledger.
+    let gone = payload::to_wire(&StatusPayload {
+        gone: true,
+        ..payload_in_repo(7, Status::Idle, "pinky")
+    });
+    let change = radar
+        .status_pipe(&gone, 2, 200, config::NamingMode::Off)
+        .expect("a gone for a tracked pane is a change");
+    assert!(change.render && change.persist_snapshot);
+    assert!(radar.status(7).is_none(), "the observation must be removed");
+
+    let lines = radar.ledger_lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].label, "shipped it");
+}
+
+#[test]
+fn gone_payload_for_an_untracked_pane_is_a_no_op() {
+    let mut radar = RadarState::default();
+    let gone = payload::to_wire(&StatusPayload {
+        gone: true,
+        ..payload_in_repo(99, Status::Idle, "repo")
+    });
+    assert!(radar
+        .status_pipe(&gone, 1, 100, config::NamingMode::Off)
+        .is_none());
 }
 
 #[test]

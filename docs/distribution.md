@@ -120,10 +120,10 @@ Both Cmux and code-notify converge here: **a single entrypoint every agent
 calls** — `zj-radar notify <agent> [event]` — which figures out the event from
 its argv subcommand + the JSON the agent passes (Codex hooks: JSON on stdin;
 Codex legacy notify: JSON on argv; Claude: type on argv + JSON on stdin).
-It maps all of them to one
-`zellij pipe --name zj_radar.status.v1` broadcast and **no-ops when not running
-under Zellij** (gate on `$ZELLIJ`). This collapses our two shell scripts into one
-code path and keeps the "wire up with one command" promise.
+It maps all of them to one named
+`zellij pipe --name zj_radar.status.v1` fan-out and **no-ops when
+not running under Zellij** (gate on `$ZELLIJ`). Only plugins subscribed to the
+status pipe receive it, including every sidebar instance.
 
 **Form factor:** a small native **`zj-radar` CLI binary** (Rust) with
 subcommands `notify`, `setup`, `setup --check`, and `setup --uninstall`. Native =

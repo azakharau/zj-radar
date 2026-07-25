@@ -10,6 +10,8 @@
 //!   Zellij layout ([`layout`]).
 //! - `run` ([`run`]) — turnkey launch of a Zellij session that owns its own
 //!   config with the rail preinstalled.
+//! - `remote <host> <session>` ([`remote`]) — attach to a remote radar session
+//!   while relaying its pushed pane lifecycle into the local parent pane.
 
 // Re-export the shared core so the CLI submodules keep addressing these as
 // `crate::status`, `crate::payload`, … with no per-reference churn.
@@ -23,6 +25,8 @@ mod agents;
 mod fsutil;
 pub(crate) mod layout;
 mod notify;
+mod relay;
+mod remote;
 mod run;
 mod setup;
 
@@ -88,6 +92,10 @@ enum Command {
         /// (default `generic` → the neutral ⦿ mark).
         #[arg(long)]
         source: Option<String>,
+        /// `generic` only: the agent behind this pane exited — remove its row
+        /// from the rail entirely (no --status needed).
+        #[arg(long)]
+        gone: bool,
         /// Print the payload instead of broadcasting.
         #[arg(long)]
         dry_run: bool,
@@ -99,6 +107,23 @@ enum Command {
         /// Print the zellij command instead of launching it.
         #[arg(long)]
         print_cmd: bool,
+    },
+    /// Attach to a remote radar session and relay all of its agent panes here.
+    Remote {
+        /// SSH destination or config alias.
+        #[arg(value_parser = remote::parse_host)]
+        host: String,
+        /// Remote Zellij session name.
+        #[arg(value_parser = remote::parse_session)]
+        session: String,
+    },
+    /// Remote half of `remote`; invoked over the forwarded SSH connection.
+    #[command(name = "relay", hide = true)]
+    Relay {
+        #[arg(value_parser = remote::parse_session)]
+        session: String,
+        #[arg(value_parser = relay::parse_connection)]
+        connection: String,
     },
     /// Idempotently wire installed agents and Zellij to use zj-radar.
     Setup {
@@ -156,6 +181,15 @@ pub fn run() -> std::process::ExitCode {
         Command::Run { name, print_cmd } => {
             run::run(run::RunOptions { name, print_cmd });
         }
+        Command::Remote { host, session } => {
+            remote::run(&host, &session);
+        }
+        Command::Relay {
+            session,
+            connection,
+        } => {
+            relay::run(&session, &connection);
+        }
         Command::Notify {
             agent,
             input,
@@ -163,6 +197,7 @@ pub fn run() -> std::process::ExitCode {
             msg,
             task,
             source,
+            gone,
             dry_run,
         } => {
             if agent == "generic" {
@@ -171,6 +206,7 @@ pub fn run() -> std::process::ExitCode {
                     msg.as_deref(),
                     task.as_deref(),
                     source.as_deref(),
+                    gone,
                     dry_run,
                 );
             } else {

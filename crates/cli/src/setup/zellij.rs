@@ -34,7 +34,7 @@ pub(crate) fn inject_mode(inject_flag: bool, yes: bool, dry_run: bool, is_tty: b
 }
 
 /// Pure: the argument vector for `zellij plugin --floating --width 90 --height
-/// 28 file:<wasm_path>`. Unit-tested so the exec call stays thin.
+/// 28 -- file:<wasm_path>`. The separator is required by Zellij 0.44.
 pub(crate) fn grant_args(wasm_path: &Path) -> Vec<String> {
     vec![
         "plugin".to_string(),
@@ -43,11 +43,12 @@ pub(crate) fn grant_args(wasm_path: &Path) -> Vec<String> {
         "90".to_string(),
         "--height".to_string(),
         "28".to_string(),
+        "--".to_string(),
         format!("file:{}", wasm_path.display()),
     ]
 }
 
-/// Exec `zellij plugin --floating … file:<wasm_dest>` for the one-time
+/// Exec `zellij plugin --floating … -- file:<wasm_dest>` for the one-time
 /// permission grant. Reports the error but does not exit — callers may choose.
 pub(crate) fn run_grant(config_dir: &Path) {
     use std::process::Command;
@@ -915,6 +916,7 @@ mod tests {
                 "90",
                 "--height",
                 "28",
+                "--",
                 "file:/home/user/.config/zellij/plugins/zj_radar.wasm",
             ]
         );

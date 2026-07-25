@@ -194,6 +194,13 @@ teardown() { teardown_fakes; }
   [ "$(jq -r '.status' <<<"$BASH_PAYLOAD")" = done ]
 }
 
+@test "parity: startup broadcasts blank idle identity in both producers" {
+  parity_payloads '{"hook_event_name":"SessionStart","source":"startup","cwd":"/home/u/myrepo"}' idle
+  [ "$(jq -r '.status' <<<"$BASH_PAYLOAD")" = idle ]
+  [ "$(jq -r '.msg' <<<"$BASH_PAYLOAD")" = "" ]
+  [ "$(jq -r '.source' <<<"$BASH_PAYLOAD")" = claude ]
+}
+
 @test "parity: idle clears the message in both producers" {
   # idle is intentionally blank: both producers must agree on status=idle AND
   # an empty msg, even when a stale message rides in on the SessionStart payload.

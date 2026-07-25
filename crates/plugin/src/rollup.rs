@@ -25,6 +25,9 @@ pub(crate) struct TerminalPane {
     pub id: u32,
     pub title: String,
     pub focused_in_tab: bool,
+    /// The pane's root process reports lifecycle through the status pipe, so
+    /// foreground child processes must not open command-origin observations.
+    pub push_owned: bool,
 }
 
 /// The end-result of a finished *command* pane, shown as a tag after the
@@ -73,6 +76,20 @@ pub enum PaneDisplay {
         outcome: Option<Outcome>,
         /// Waiting-on-you stamp (Pending only) — see `PrimaryDetail`.
         pending_epoch_s: Option<u64>,
+        /// This row came from an explicit status-pipe producer (not the
+        /// command heuristic). An announced row with an unrecognized source
+        /// (`Kind::Other`, e.g. a generic status producer) still counts
+        /// as an agent for the agents-only rail — the producer vouched for it.
+        announced: bool,
+        /// The observation has ever been active. An Idle row that HAS worked
+        /// is a leftover (agent exited or was cleared) — the agents-only rail
+        /// hides it, while a never-active Idle row is a fresh identity
+        /// announcement from a live agent and stays visible.
+        ever_active: bool,
+        /// This pane is the focused pane of its tab (session-wide fact from
+        /// the PaneManifest, identical for every rail instance). The renderer
+        /// combines it with `TabRow.active` to bold the agent you're in.
+        focused: bool,
     },
     Untracked {
         pane_id: u32,
@@ -92,6 +109,26 @@ impl PaneDisplay {
 
     pub(crate) fn is_tracked(&self) -> bool {
         matches!(self, Self::Tracked { .. })
+    }
+
+    /// Whether this pane belongs on the agents-only rail: a recognized
+    /// agent kind from either origin, or any explicitly announced
+    /// (status-pipe) row whose source didn't classify — `Kind::Other`
+    /// covers generic status producers; command-heuristic rows with non-agent kinds
+    /// stay hidden. Idle agents STAY on the rail (the sidebar's contract is
+    /// "every open agent in the session, with status"); rows leave only
+    /// when the producer says `gone` or the pane closes.
+    pub(crate) fn is_agent(&self) -> bool {
+        match self {
+            Self::Tracked {
+                kind, announced, ..
+            } => kind.is_agent() || (*announced && *kind == Kind::Other),
+            Self::Untracked { .. } => false,
+        }
+    }
+
+    pub(crate) fn is_focused(&self) -> bool {
+        matches!(self, Self::Tracked { focused: true, .. })
     }
 
     pub(crate) fn pane_id(&self) -> u32 {
@@ -132,16 +169,6 @@ impl PaneDisplay {
         }
     }
 
-    /// The tick this pane's status last changed (`None` for an untracked
-    /// pane, which has no observation to date it from). Feeds `spin_glyph`'s
-    /// long-runner easing in `render.rs`.
-    pub(crate) fn since_tick(&self) -> Option<u64> {
-        match self {
-            Self::Tracked { since_tick, .. } => Some(*since_tick),
-            Self::Untracked { .. } => None,
-        }
-    }
-
     pub(crate) fn outcome(&self) -> Option<Outcome> {
         match self {
             Self::Tracked { outcome, .. } => *outcome,
@@ -179,9 +206,9 @@ pub struct ProgressCounts {
 /// the precedence across observation sources (status pipe vs command); this
 /// function only sees "is there an observation for this pane?".
 ///
-/// A pane with no observation — or one that has never been active — renders as an
-/// untracked pane and does not count toward `done/total`. `pending` is counted
-/// whenever an observation reports `Pending`, active or not.
+/// A pane with no observation renders as untracked. A never-active observation
+/// does too, unless it is an agent identity announced through the status pipe.
+/// Only ever-active observations count toward `done/total/pending`.
 pub fn roll_up<'a>(
     panes: &[TerminalPane],
     resolve: impl Fn(u32) -> Option<&'a TrackedObservation>,
@@ -209,15 +236,35 @@ pub fn roll_up<'a>(
             if s.status == Status::Pending {
                 pending += 1;
             }
+        }
+        let announced = s.origin == ObservationOrigin::StatusPipe;
+        if s.ever_active || (announced && (s.kind.is_agent() || s.kind == Kind::Other)) {
+            // The sticky task label prefers what the producer sent; when it
+            // never did (resumed omp sessions never surface their name
+            // through the extension API), fall back to the pane title omp
+            // itself maintains — `π: <session name>` — which is exactly the
+            // name the user sees in omp's own UI.
+            let task = if s.task.is_empty() {
+                pane.title
+                    .strip_prefix("π: ")
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                s.task.clone()
+            };
             pane_displays.push(PaneDisplay::Tracked {
                 pane_id: pane.id,
                 kind: s.kind,
                 status: s.status,
                 msg: s.msg.clone(),
-                task: s.task.clone(),
+                task,
                 since_tick: s.last_change_tick,
                 outcome: pane_outcome(s),
                 pending_epoch_s: s.pending_epoch_s,
+                announced,
+                ever_active: s.ever_active,
+                focused: pane.focused_in_tab,
             });
         } else {
             pane_displays.push(PaneDisplay::untracked(pane.id, &pane.title));

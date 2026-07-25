@@ -31,7 +31,8 @@ pub(crate) const CODEX_HOOK_MARKER: &str = "ZJ_RADAR_CODEX_HOOK=v1";
 pub(crate) const CODEX_HOOK_COMMAND: &str = "ZJ_RADAR_CODEX_HOOK=v1 zj-radar notify codex";
 pub(crate) const CODEX_HOOK_COMMAND_WINDOWS: &str =
     "cmd /C \"set ZJ_RADAR_CODEX_HOOK=v1&& zj-radar notify codex\"";
-pub(crate) const CODEX_HOOK_EVENTS: [&str; 7] = [
+pub(crate) const CODEX_HOOK_EVENTS: [&str; 8] = [
+    "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PermissionRequest",

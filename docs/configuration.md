@@ -27,8 +27,10 @@ ignored and invalid values fall back to the default (parsing never fails):
 | `density` | `cards` · `comfortable` · `compact` | `cards` | Card surface bands / blank separators / flush rail. |
 | `naming` | `off` · `managed` · `force` | `managed` | Auto-rename tabs from agent repo / pane title. `managed` only touches default or self-applied names; `force` overrides manual names. The self-applied memory lives in plugin memory, so after a Zellij server restart previously auto-applied names read as manual — use `force`, or rename the tab back to its default (`Tab #N`) to re-enable managed naming. |
 | `header` | `true` · `false` | `true` | Show the ` RADAR` identity header + tab count. |
+| `agents_only` | `true` · `false` | `false` | Render a flat live-agent rail: one row per tracked agent pane, deliberately minimal — status glyph, source mark, and Zellij tab name. Internal agent task/title strings do not replace the tab name. A second message line appears only while the agent needs attention and sent informative text; there is no wait tag or tally footer. Native mouse-wheel scrolls when agents exceed pane height. Qualifying panes remain visible while open, including Idle agents; a row leaves when its producer says `gone` or its pane closes. Explicitly announced rows with an unrecognized source also render (`⦿ other`). Tab labels/wrappers, non-agent panes, session badges, history, and jump hints are hidden; no agents renders an empty rail. |
+| `agents_pad_top` | `0`–`15` | `0` | Blank rows above the first agent row in the flat rail, so rows sit below the pane's very top edge. Padding is click-inert and scrolls away with the wheel. `agents_only` mode only. |
 | `glyphs` | `plain` · `nerd` | `plain` | Status glyph set (`nerd` needs a Nerd Font). |
-| `jump_hint` | `alt-n` · anything else | hidden | Footer advertises ` alt-[n] jump`. Opt in only when Alt+digit actually reaches Zellij on your machine: the binds must exist in your Zellij config (`zj-radar run` sessions bake Alt-1..9 → `GoToTab`, but don't set this — window managers commonly claim Alt+digit system-wide, and macOS terminals type `¡` unless option-as-alt is on). The rail never advertises a chord it can't verify. |
+| `jump_hint` | `alt-n` · anything else | hidden | Footer advertises `Alt-[n] jump`. Opt in only when Alt+digit actually reaches Zellij on your machine: the binds must exist in your Zellij config (`zj-radar run` sessions bake Alt-1..9 → `GoToTab`, but don't set this — window managers commonly claim Alt+digit system-wide, and macOS terminals type `¡` unless option-as-alt is on). The rail never advertises a chord it can't verify. |
 | `notify` | `true` · `false` | `true` | Master switch for OS desktop notifications (macOS `osascript`, Linux `notify-send`). |
 | `notify_done` | `true` · `false` | `true` | Notify when a pane transitions into `done`. |
 | `notify_error` | `true` · `false` | `true` | Notify when a pane transitions into `error`. |
@@ -144,21 +146,23 @@ that session's last focus. The badge — and therefore cycling — only has
 something to step through once a second zj-radar session is live; with just
 one session running, `session-next`/`session-prev` are no-ops.
 
-Dimmed (stale) badge entries are skipped by cycling, but you can dismiss one
-by right-clicking it directly in the rail — a mouse gesture, not a `cmd.v1`
-verb; a dismissed session that turns out to be alive reappears on its next
-heartbeat.
+Once a peer presence is observed more than 90 seconds old, it is omitted from
+both the badge and session cycling. Every rail checks once a second, including
+when otherwise idle; each live session refreshes its own heartbeat once a
+minute. Its presence state and file remain, so a fresh heartbeat makes it
+reappear on the next check. A conservative sweep at plugin load removes only
+genuinely abandoned presence files older than 6 hours.
 
-Right-click is the rail's general acknowledge/dismiss gesture, not only a
-badge thing — the rule is **left-click navigates, right-click
-acknowledges** everywhere on the rail. Beyond a stale badge entry (above),
-right-clicking a pane or tab row still flagged `◆ needs you` acknowledges
-it: the row downgrades to `done`, and — because a click lands in exactly one
-plugin instance — it converges by re-broadcasting a `done` update over
-`zj_radar.status.v1`, the same pipe a real agent hook uses, rather than
-mutating this instance's state directly. Every tab's instance (including the
-one you clicked in) picks up the change through the normal status-pipe
-intake. A row with nothing pending is a no-op.
+Left-click is the rail's navigation and acknowledge gesture. Clicking a pane
+or tab row switches to it; if that row is still flagged `◆ needs you`, the
+same click acknowledges it. The row downgrades to `done`, and — because a
+click lands in exactly one plugin instance — it converges by re-broadcasting
+a `done` update over `zj_radar.status.v1`, the same pipe a real agent hook
+uses, rather than mutating this instance's state directly. Every tab's
+instance (including the one you clicked in) picks up the change through the
+normal status-pipe intake. A row with nothing pending only navigates.
+Right-click is intentionally unused because Zellij does not deliver it to a
+nonselectable sidebar pane.
 
 Like every command pipe, an unknown verb is ignored, and the action is inert
 until the sidebar has been granted permissions.

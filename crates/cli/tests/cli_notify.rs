@@ -36,6 +36,10 @@ fn claude_posttooluse_edit_broadcasts_editing_activity() {
         c.args.contains(&"pipe".to_string()),
         "expected 'pipe' subcommand in: {argv}"
     );
+    assert!(
+        !argv.contains("--plugin"),
+        "a --plugin pipe launches rogue instances when the rail is missing: {argv}"
+    );
     assert_eq!(c.stdin, "", "payload should be sent as argv, not stdin");
     assert!(
         argv.contains("\"pane\""),
