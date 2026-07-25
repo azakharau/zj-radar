@@ -19,8 +19,9 @@ use zj_radar_core::{parse, to_wire, Kind, Status, StatusPayload};
 /// The zjstatus widget key. It includes the `pipe_` prefix on purpose: zjstatus
 /// derives its map key by stripping only the trailing `_format` / `_rendermode`
 /// from the config key (its `PIPE_REGEX` is `_[a-zA-Z0-9]+$`), so
-/// `pipe_agents_format` → `pipe_agents`, and the wire payload must match.
-pub const DEFAULT_PIPE_NAME: &str = "pipe_agents";
+/// `pipe_agents_tabs_format` → `pipe_agents_tabs`, and the wire payload must
+/// match.
+pub const DEFAULT_PIPE_NAME: &str = "pipe_agents_tabs";
 
 /// Ticks (≈ seconds) before an agent that has stopped reporting is dropped. A
 /// producer that dies without sending `gone` — killed terminal, crashed hook —
@@ -122,16 +123,6 @@ impl Config {
         format!("zjstatus::pipe::{}::{}", self.pipe_name, output)
     }
 
-    /// The same line for a sibling widget, named by suffixing the configured
-    /// base. With the default `pipe_agents`, `suffix = "tabs"` addresses
-    /// `pipe_agents_tabs`, so both widgets stay renamable from one config key
-    /// and cannot drift apart.
-    pub fn pipe_payload_for(&self, suffix: &str, output: &str) -> String {
-        format!(
-            "zjstatus::pipe::{}_{}::{}",
-            self.pipe_name, suffix, output
-        )
-    }
 }
 
 fn non_empty(configuration: &BTreeMap<String, String>, key: &str) -> Option<String> {
@@ -207,6 +198,15 @@ pub struct Agents {
 impl Agents {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Terminal pane ids with a live agent. Used by callers that need to relate
+    /// agents back to panes without reaching into the entry map.
+    pub fn pane_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.entries.keys().map(|(pane_id, _)| *pane_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Fold one status payload in. Returns whether the aggregate could have
@@ -302,55 +302,6 @@ impl Agents {
         self.entries.len() != before
     }
 
-    /// The `{pipe_agents}` string: one `icon + glyph` group per agent vendor,
-    /// most urgent first, with a count appended when a vendor holds more than
-    /// one pane. Empty when nothing is live, so the widget disappears entirely.
-    ///
-    /// Grouping walks `Kind::ALL` rather than hashing `Kind` (which is neither
-    /// `Hash` nor `Ord`); the list is short and its order is the tiebreak for
-    /// vendors sharing a status.
-    pub fn render(&self, glyphs: GlyphSet) -> String {
-        let mut groups: Vec<(Kind, Status, usize)> = Kind::ALL
-            .iter()
-            .filter_map(|&kind| {
-                let mut worst: Option<Status> = None;
-                let mut count = 0usize;
-                for entry in self.entries.values().filter(|e| e.kind == kind) {
-                    // `Status` is declared in ascending-severity order and derives
-                    // `Ord`, so `max` IS the documented aggregation rule
-                    // (error > pending > running > done).
-                    worst = Some(worst.map_or(entry.status, |w: Status| w.max(entry.status)));
-                    count += 1;
-                }
-                worst.map(|status| (kind, status, count))
-            })
-            .collect();
-        if groups.is_empty() {
-            return String::new();
-        }
-        // Stable sort, so vendors sharing a status keep `Kind::ALL` order.
-        groups.sort_by_key(|group| std::cmp::Reverse(group.1));
-
-        let mut out = String::new();
-        for (kind, status, count) in groups {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str("#[fg=");
-            out.push_str(role_hex(status.role()));
-            out.push(']');
-            out.push(kind.mark(glyphs));
-            out.push(status.glyph_for(glyphs));
-            if count > 1 {
-                out.push_str(&count.to_string());
-            }
-        }
-        // The widget sits directly against `{pipe_resources}` in `format_right`;
-        // the trailing space is the separator, and it must not exist when the
-        // widget is empty or the bar gains a phantom gap.
-        out.push(' ');
-        out
-    }
 
     /// True while any agent is working, i.e. while the spinner must animate. The
     /// caller uses this to pick a fast frame cadence and drop back to an idle one
@@ -578,6 +529,18 @@ mod tests {
         GlyphSet::Nerd
     }
 
+    /// Render every live pane as if it sat in one inactive tab. The aggregation
+    /// tests care about which glyphs/counts/colours come out, not about tab
+    /// topology, so this keeps them focused.
+    fn no_agent_shown(out: &str) -> bool {
+        !Kind::ALL.iter().any(|k| out.contains(k.mark(nerd())))
+    }
+
+    fn render_all(agents: &Agents) -> String {
+        let map: HashMap<u32, usize> = agents.pane_ids().into_iter().map(|p| (p, 0)).collect();
+        agents.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0)
+    }
+
     impl Agents {
         fn default_with(payload: &StatusPayload) -> Agents {
             let mut agents = Agents::default();
@@ -588,24 +551,24 @@ mod tests {
 
     #[test]
     fn empty_registry_renders_nothing() {
-        assert_eq!(Agents::default().render(nerd()), "");
+        assert!(no_agent_shown(&render_all(&Agents::default())));
     }
 
     #[test]
     fn a_single_agent_renders_its_mark_and_glyph_without_a_count() {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Running), 0);
-        let out = agents.render(nerd());
-        // Compared whole, not by `contains`: the `#[fg=#7AA2F7]` colour prefix
-        // has digits of its own, so a substring check for "no count" would pass
-        // vacuously.
-        assert_eq!(
-            out,
-            format!(
-                "#[fg=#7AA2F7]{}{} ",
-                Kind::Claude.mark(nerd()),
-                Status::Running.glyph_for(nerd())
-            )
+        let out = render_all(&agents);
+        // A lone agent shows vendor + spinner and NO trailing count digit.
+        let cluster = format!("{} ", Kind::Claude.mark(nerd()));
+        assert!(out.contains(&cluster), "{out:?}");
+        // Look only at the cluster itself: from the vendor mark up to the next
+        // colour directive. Beyond that, the palette hexes are full of digits.
+        let from_mark = &out[out.find(Kind::Claude.mark(nerd())).unwrap()..];
+        let cluster_only = &from_mark[..from_mark.find("#[").unwrap_or(from_mark.len())];
+        assert!(
+            !cluster_only.chars().any(|c| c.is_ascii_digit()),
+            "no count for a single agent, got cluster {cluster_only:?} in {out:?}"
         );
     }
 
@@ -614,7 +577,7 @@ mod tests {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Running), 0);
         agents.apply(&payload(2, "claude", Status::Running), 0);
-        let out = agents.render(nerd());
+        let out = render_all(&agents);
         assert_eq!(out.matches(Kind::Claude.mark(nerd())).count(), 1, "{out:?}");
         assert!(out.contains('2'), "{out:?}");
     }
@@ -624,7 +587,7 @@ mod tests {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Running), 0);
         agents.apply(&payload(2, "claude", Status::Error), 0);
-        let out = agents.render(nerd());
+        let out = render_all(&agents);
         assert!(out.contains(Status::Error.glyph_for(nerd())), "{out:?}");
         assert!(!out.contains(Status::Running.glyph_for(nerd())), "{out:?}");
     }
@@ -634,7 +597,7 @@ mod tests {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Running), 0);
         agents.apply(&payload(2, "codex", Status::Error), 0);
-        let out = agents.render(nerd());
+        let out = render_all(&agents);
         let codex = out.find(Kind::Codex.mark(nerd())).expect("codex group");
         let claude = out.find(Kind::Claude.mark(nerd())).expect("claude group");
         assert!(codex < claude, "error must sort before running: {out:?}");
@@ -654,7 +617,7 @@ mod tests {
     fn omp_is_a_first_class_vendor() {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "omp", Status::Pending), 0);
-        assert!(agents.render(nerd()).contains(Kind::Omp.mark(nerd())));
+        assert!(render_all(&agents).contains(Kind::Omp.mark(nerd())));
     }
 
     #[test]
@@ -664,7 +627,7 @@ mod tests {
         let mut gone = payload(1, "claude", Status::Running);
         gone.gone = true;
         assert!(agents.apply(&gone, 1));
-        assert_eq!(agents.render(nerd()), "");
+        assert!(no_agent_shown(&render_all(&agents)));
     }
 
     #[test]
@@ -672,7 +635,7 @@ mod tests {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Running), 0);
         agents.apply(&payload(1, "claude", Status::Idle), 1);
-        assert_eq!(agents.render(nerd()), "");
+        assert!(no_agent_shown(&render_all(&agents)));
     }
 
     #[test]
@@ -683,7 +646,7 @@ mod tests {
         let mut acked = payload(1, "claude", Status::Pending);
         acked.ack = true;
         agents.apply(&acked, 0);
-        assert!(agents.render(nerd()).contains(Status::Pending.glyph_for(nerd())));
+        assert!(render_all(&agents).contains(Status::Pending.glyph_for(nerd())));
     }
 
     #[test]
@@ -699,7 +662,7 @@ mod tests {
         agents.apply(&payload(1, "claude", Status::Running), 0);
         agents.apply(&payload(2, "codex", Status::Running), 0);
         assert!(agents.retain_panes(&HashSet::from([2])));
-        let out = agents.render(nerd());
+        let out = render_all(&agents);
         assert!(!out.contains(Kind::Claude.mark(nerd())), "{out:?}");
         assert!(out.contains(Kind::Codex.mark(nerd())), "{out:?}");
     }
@@ -724,15 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_is_the_exact_zjstatus_pipe_line() {
-        let config = Config::default();
-        assert_eq!(
-            config.pipe_payload("#[fg=#7AA2F7]x "),
-            "zjstatus::pipe::pipe_agents::#[fg=#7AA2F7]x "
-        );
-    }
-
-    #[test]
     fn rendered_output_never_contains_a_newline() {
         // zjstatus treats `\n` as its protocol line separator, so one in the
         // content would truncate or corrupt the widget.
@@ -740,7 +694,7 @@ mod tests {
         for (i, source) in ["claude", "codex", "omp", "gemini"].iter().enumerate() {
             agents.apply(&payload(i as u32, source, Status::Pending), 0);
         }
-        assert!(!agents.render(nerd()).contains('\n'));
+        assert!(!render_all(&agents).contains('\n'));
     }
 
     #[test]
@@ -785,8 +739,8 @@ mod tests {
         after.restore(&before.snapshot(), 0);
 
         assert_eq!(
-            after.render(nerd()),
-            before.render(nerd()),
+            render_all(&after),
+            render_all(&before),
             "a reload must reproduce the same bar"
         );
     }
@@ -796,7 +750,7 @@ mod tests {
         let mut after = Agents::default();
         after.restore(&Agents::default().snapshot(), 0);
         assert!(after.is_empty());
-        assert_eq!(after.render(nerd()), "");
+        assert!(no_agent_shown(&render_all(&after)));
     }
 
     #[test]
@@ -819,7 +773,7 @@ mod tests {
         let good = Agents::default_with(&payload(1, "claude", Status::Running));
         let mixed = format!("not json\n\n{}\n{{\"v\":1}}\n", good.snapshot());
         agents.restore(&mixed, 0);
-        assert!(agents.render(nerd()).contains(Kind::Claude.mark(nerd())));
+        assert!(render_all(&agents).contains(Kind::Claude.mark(nerd())));
     }
 
     #[test]
@@ -1113,10 +1067,12 @@ mod tests {
     }
 
     #[test]
-    fn sibling_widget_payload_is_addressed_by_suffix() {
-        let config = Config::default();
+    fn payload_is_the_exact_zjstatus_pipe_line_for_the_configured_widget() {
+        // The widget key must include the `pipe_` prefix: zjstatus strips only the
+        // trailing `_format` / `_rendermode` from its config key, so
+        // `pipe_agents_tabs_format` -> `pipe_agents_tabs`.
         assert_eq!(
-            config.pipe_payload_for("tabs", "X"),
+            Config::default().pipe_payload("X"),
             "zjstatus::pipe::pipe_agents_tabs::X"
         );
     }
@@ -1125,6 +1081,6 @@ mod tests {
     fn an_unknown_source_still_renders_as_other() {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "some-new-agent", Status::Running), 0);
-        assert!(agents.render(nerd()).contains(Kind::Other.mark(nerd())));
+        assert!(render_all(&agents).contains(Kind::Other.mark(nerd())));
     }
 }

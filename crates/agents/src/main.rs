@@ -142,14 +142,9 @@ mod plugin {
                         self.frame = self.frame.wrapping_add(1);
                     }
                     let expired = self.agents.expire(self.elapsed as u64, &self.config);
-                    let state_changed = self.dirty || expired;
-                    if state_changed || animating {
+                    if self.dirty || expired || animating {
                         self.dirty = false;
-                        // On a pure animation frame only the spinner moved, so
-                        // send just the tab strip: the roll-up is unchanged and
-                        // re-sending it would make zjstatus re-process a second
-                        // widget 5 times a second for nothing.
-                        self.publish(!state_changed);
+                        self.publish();
                     }
                     set_timeout(if animating {
                         self.config.animate_secs()
@@ -264,24 +259,16 @@ mod plugin {
 
         /// The ONE place that talks to other plugins. Reached only from the
         /// `Timer` arm, never from `pipe` — see `pipe` for why that matters.
-        fn publish(&mut self, tabs_only: bool) {
+        fn publish(&mut self) {
             self.persist();
             let glyphs = self.config.glyphs();
-            // Both widgets in ONE message: zjstatus's protocol treats '\n' as a
-            // directive separator, so a single broadcast updates the per-tab strip
-            // and the right-hand roll-up together. (The *content* of each widget
-            // must still be newline-free, or it would be read as a directive.)
-            let tabs = self.config.pipe_payload_for(
-                "tabs",
+            // One widget, one directive. The content must stay newline-free:
+            // zjstatus reads '\n' as a directive separator.
+            let payload = self.config.pipe_payload(
                 &self
                     .agents
                     .render_tabs(&self.tabs, &self.pane_tab, glyphs, self.frame),
             );
-            let payload = if tabs_only {
-                tabs
-            } else {
-                format!("{tabs}\n{}", self.config.pipe_payload(&self.agents.render(glyphs)))
-            };
             if self.last_published.as_deref() == Some(payload.as_str()) {
                 return;
             }
