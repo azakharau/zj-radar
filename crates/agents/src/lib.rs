@@ -522,21 +522,19 @@ fn fit_to_width(segments: Vec<(bool, String)>, budget: usize) -> String {
     out
 }
 
-/// Working spinner: `cli-spinners`' `dots9` set — a full-height 4x2 ring inside
-/// ONE braille cell, rotating.
+/// Working spinner: a 3-dot arc travelling the perimeter of one braille cell.
 ///
-/// Standard set, so it stays consistent with what ora/Ink and the agent harnesses
-/// animate. Chosen over its siblings by weight: `dots` uses only rows 0-2 and 3-4
-/// dots, which is small next to a vendor glyph; `dots2`/`dots13` light 6-7 of 8
-/// dots and read as a solid blob rather than something turning. `dots9` averages
-/// 5 dots across all four rows — full height, clearly a rotating ring.
+/// Two braille cells would be four dot-columns wide, so the whole animation lives
+/// in ONE cell: 2 columns x 4 rows, the arc walking its eight perimeter positions
+/// clockwise. Full height, and exactly three CONTIGUOUS dots at every frame.
 ///
-/// Both earlier attempts failed for the same reason and it is worth recording:
-/// core's `working_spin` and a hand-built hollow square each spanned TWO cells, so
-/// the motion was spread over eight dot-columns and read as scattered specks.
-/// Everything staying inside one cell is what makes it legible as a single
-/// spinning thing.
-const SPINNER: [&str; 8] = ["⢹", "⢺", "⢼", "⣸", "⣇", "⡧", "⡗", "⡏"];
+/// Contiguity is the point, and it is what the previous sets got wrong.
+/// `cli-spinners`' `dots9` lights a whole column PLUS a detached dot, so it reads
+/// as a dotted line with specks beside it rather than one moving thing; `dots2`
+/// lights seven of eight and reads as a solid block. Earlier still, core's
+/// `working_spin` and a hollow square each spanned TWO cells, spreading the motion
+/// over eight dot-columns — scattered specks again.
+const SPINNER: [&str; 8] = ["⠙", "⠸", "⢰", "⣠", "⣄", "⡆", "⠇", "⠋"];
 
 /// The status glyph, animated for `Running` only. Every other state is a settled
 /// fact and a moving glyph would imply otherwise.
@@ -1150,25 +1148,45 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_is_a_single_cell_full_height_ring() {
+    fn the_spinner_is_a_contiguous_arc_in_one_cell() {
+        // Dot bit -> (column, row) for a braille cell.
+        const POS: [(u32, usize, usize); 8] = [
+            (0x01, 0, 0), (0x02, 0, 1), (0x04, 0, 2), (0x40, 0, 3),
+            (0x08, 1, 0), (0x10, 1, 1), (0x20, 1, 2), (0x80, 1, 3),
+        ];
+        // Perimeter walk, clockwise. Adjacency is defined along THIS ring, which
+        // is what "contiguous" means for a glyph only two columns wide.
+        let ring: Vec<(usize, usize)> =
+            vec![(0, 0), (1, 0), (1, 1), (1, 2), (1, 3), (0, 3), (0, 2), (0, 1)];
         let mut rows_seen = std::collections::HashSet::new();
+
         for f in &SPINNER {
             let chars: Vec<char> = f.chars().collect();
             assert_eq!(chars.len(), 1, "frame {f:?} must be ONE cell wide");
             let bits = chars[0] as u32 - 0x2800;
-            // Substantial enough to read as a ring, not so full it looks solid.
-            assert!((4..=6).contains(&bits.count_ones()), "frame {f:?} dot count");
-            for (bit, row) in [
-                (0x01, 0), (0x08, 0), (0x02, 1), (0x10, 1),
-                (0x04, 2), (0x20, 2), (0x40, 3), (0x80, 3),
-            ] {
-                if bits & bit != 0 {
-                    rows_seen.insert(row);
-                }
-            }
+            assert_eq!(bits.count_ones(), 3, "frame {f:?} must light exactly 3 dots");
+
+            let lit: Vec<usize> = POS
+                .iter()
+                .filter(|(bit, _, _)| bits & bit != 0)
+                .map(|(_, c, r)| {
+                    rows_seen.insert(*r);
+                    ring.iter().position(|p| p == &(*c, *r)).expect("on the ring")
+                })
+                .collect();
+            // The three positions must be consecutive on the ring (mod 8), i.e. an
+            // arc — never a column plus a detached dot, which is what read as specks.
+            let mut idx = lit.clone();
+            idx.sort_unstable();
+            let contiguous = (0..8).any(|start| {
+                let mut want: Vec<usize> = (0..3).map(|k| (start + k) % 8).collect();
+                want.sort_unstable();
+                want == idx
+            });
+            assert!(contiguous, "frame {f:?} must be a contiguous arc, got {idx:?}");
         }
-        assert_eq!(rows_seen.len(), 4, "the ring must use all four rows (4x2)");
-        assert_eq!(SPINNER.len(), 8, "the cli-spinners `dots9` cycle");
+        assert_eq!(rows_seen.len(), 4, "the arc must use all four rows (4x2)");
+        assert_eq!(SPINNER.len(), 8, "one frame per perimeter position");
         for w in SPINNER.windows(2) {
             assert_ne!(w[0], w[1], "consecutive frames must differ");
         }
