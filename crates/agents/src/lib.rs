@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zj_radar_core::status::{GlyphSet, Role};
+use zj_radar_core::payload::{sanitize, MAX_TAB_NAME_CHARS};
 use zj_radar_core::{parse, to_wire, Kind, Status, StatusPayload};
 
 /// The zjstatus widget key. It includes the `pipe_` prefix on purpose: zjstatus
@@ -36,6 +37,7 @@ pub const DEFAULT_DONE_TTL_TICKS: u64 = 30;
 pub struct Config {
     pipe_name: String,
     glyphs: GlyphSet,
+    animate: bool,
     ttl_ticks: u64,
     done_ttl_ticks: u64,
 }
@@ -45,6 +47,7 @@ impl Default for Config {
         Config {
             pipe_name: DEFAULT_PIPE_NAME.to_string(),
             glyphs: GlyphSet::default(),
+            animate: true,
             ttl_ticks: DEFAULT_TTL_TICKS,
             done_ttl_ticks: DEFAULT_DONE_TTL_TICKS,
         }
@@ -64,6 +67,14 @@ impl Config {
                 .get("glyphs")
                 .and_then(|s| GlyphSet::from_config(s))
                 .unwrap_or(defaults.glyphs),
+            // Animating the working glyph costs ~5-11% server CPU, because each
+            // frame is an IPC broadcast plus a full zjstatus repaint. Worth it
+            // for the at-a-glance "it's alive" signal, but not everyone's
+            // trade — `animate false` pins a static glyph and never leaves the
+            // idle cadence (measured 0.0% CPU).
+            animate: non_empty(configuration, "animate")
+                .map(|v| !matches!(v.as_str(), "false" | "0" | "no" | "off"))
+                .unwrap_or(defaults.animate),
             ttl_ticks: parse_ticks(configuration, "ttl_secs").unwrap_or(defaults.ttl_ticks),
             done_ttl_ticks: parse_ticks(configuration, "done_ttl_secs")
                 .unwrap_or(defaults.done_ttl_ticks),
@@ -74,12 +85,27 @@ impl Config {
         self.glyphs
     }
 
+    pub fn animate(&self) -> bool {
+        self.animate
+    }
+
     /// The exact line zjstatus expects: it splits on `::`, requires the
     /// `zjstatus` sentinel and the `pipe` command, then stores the remainder
     /// under the widget key. Newlines are the protocol's line separator, so the
     /// caller must never put one in `output`.
     pub fn pipe_payload(&self, output: &str) -> String {
         format!("zjstatus::pipe::{}::{}", self.pipe_name, output)
+    }
+
+    /// The same line for a sibling widget, named by suffixing the configured
+    /// base. With the default `pipe_agents`, `suffix = "tabs"` addresses
+    /// `pipe_agents_tabs`, so both widgets stay renamable from one config key
+    /// and cannot drift apart.
+    pub fn pipe_payload_for(&self, suffix: &str, output: &str) -> String {
+        format!(
+            "zjstatus::pipe::{}_{}::{}",
+            self.pipe_name, suffix, output
+        )
     }
 }
 
@@ -102,6 +128,31 @@ struct Entry {
     status: Status,
     seen: u64,
 }
+
+/// One tab as the status bar needs to draw it. Mirrors the fields of Zellij's
+/// `TabInfo` that matter here, so the pure renderer never sees `zellij-tile`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabView {
+    pub position: usize,
+    pub name: String,
+    pub active: bool,
+    /// `TabInfo::has_bell_notification` — a pane in this tab rang and has not
+    /// been looked at yet. Rendered here rather than by zjstatus because
+    /// zjstatus 0.23 has no bell support at all, and the data comes from Zellij.
+    pub bell: bool,
+    /// `TabInfo::is_flashing_bell` — the transient 400ms flash right after the
+    /// bell. Only visible if the bar repaints fast enough, which the animation
+    /// cadence already guarantees.
+    pub flashing_bell: bool,
+}
+
+/// Tokyo Night palette, matching the hand-written zjstatus config this replaces
+/// so the strip looks native rather than bolted on.
+const BG: &str = "#222436";
+const TAB_ACTIVE_BG: &str = "#7AA2F7";
+const TAB_NAME: &str = "#A9B1D6";
+const TAB_DIM: &str = "#565F89";
+const INK: &str = "#222436";
 
 /// Live agent observations, keyed by Zellij terminal pane id.
 #[derive(Default, Debug)]
@@ -254,6 +305,136 @@ impl Agents {
         // widget is empty or the bar gains a phantom gap.
         out.push(' ');
         out
+    }
+
+    /// True while any agent is working, i.e. while the spinner must animate. The
+    /// caller uses this to pick a fast frame cadence and drop back to an idle one
+    /// the moment nothing is moving.
+    pub fn any_running(&self) -> bool {
+        self.entries.values().any(|e| e.status == Status::Running)
+    }
+
+    /// The worst status among one tab's panes, with how many agents it holds, or
+    /// `None` when the tab has no agent.
+    fn tab_status(
+        &self,
+        position: usize,
+        pane_tab: &HashMap<u32, usize>,
+    ) -> Option<(Kind, Status, usize)> {
+        let mut worst: Option<(Kind, Status)> = None;
+        let mut count = 0usize;
+        for (pane_id, entry) in &self.entries {
+            if pane_tab.get(pane_id) != Some(&position) {
+                continue;
+            }
+            count += 1;
+            // `Status` is ascending-severity and derives `Ord`, so this IS the
+            // documented priority: error > pending > running > done.
+            if worst.is_none_or(|(_, w)| entry.status > w) {
+                worst = Some((entry.kind, entry.status));
+            }
+        }
+        worst.map(|(kind, status)| (kind, status, count))
+    }
+
+    /// Render the whole tab strip, replacing zjstatus's own `{tabs}`.
+    ///
+    /// zjstatus's per-tab tokens are a closed set (`{index}`, `{name}`, sync /
+    /// fullscreen / floating) with no way to inject agent state. So the only way
+    /// to show status *per tab* — short of renaming the user's tabs, which needs
+    /// `ChangeApplicationState` and mutates state we do not own — is to draw the
+    /// strip here and hand it over as one pipe value.
+    ///
+    /// A tab holding an agent reads `<vendor><status> │ <name>`, the status glyph
+    /// animating while it works. The ACTIVE tab takes the status colour as its
+    /// background, so "where am I" and "what is it doing" cost no extra width.
+    /// Tabs with no agent keep zjstatus's stock look.
+    pub fn render_tabs(
+        &self,
+        tabs: &[TabView],
+        pane_tab: &HashMap<u32, usize>,
+        glyphs: GlyphSet,
+        frame: usize,
+    ) -> String {
+        let mut out = String::new();
+        for tab in tabs {
+            let bell = bell_glyph(tab);
+            // Tab names are user-controlled and reach us verbatim from Zellij. A
+            // newline would be read as a zjstatus directive separator (this
+            // string is published alongside a second directive), and an escape
+            // sequence could repaint the bar arbitrarily. Core's sanitizer
+            // already strips control chars, bidi overrides and ANSI/OSC, and
+            // caps the width.
+            let name = sanitize(&tab.name, MAX_TAB_NAME_CHARS);
+            match (tab.active, self.tab_status(tab.position, pane_tab)) {
+                (true, Some((kind, status, count))) => {
+                    let role = role_hex(status.role());
+                    out.push_str(&format!("#[fg={INK},bg={role},bold] "));
+                    out.push(kind.mark(glyphs));
+                    out.push_str(&status_glyph(status, glyphs, frame));
+                    out.push_str(" │ ");
+                    out.push_str(&name);
+                    push_count(&mut out, count);
+                    out.push_str(&bell);
+                    out.push_str(&format!(" #[fg={role},bg={BG}]"));
+                }
+                (true, None) => {
+                    out.push_str(&format!("#[fg={INK},bg={TAB_ACTIVE_BG},bold] "));
+                    out.push_str(&name);
+                    out.push_str(&bell);
+                    out.push_str(&format!(" #[fg={TAB_ACTIVE_BG},bg={BG}]"));
+                }
+                (false, Some((kind, status, count))) => {
+                    let role = role_hex(status.role());
+                    out.push_str(&format!("#[fg={role},bg={BG}] "));
+                    out.push(kind.mark(glyphs));
+                    out.push_str(&status_glyph(status, glyphs, frame));
+                    out.push_str(&format!("#[fg={TAB_DIM}] │ #[fg={TAB_NAME}]"));
+                    out.push_str(&name);
+                    push_count(&mut out, count);
+                    out.push_str(&bell);
+                    out.push(' ');
+                }
+                (false, None) => {
+                    out.push_str(&format!(
+                        "#[fg={TAB_DIM},bg={BG}] {}:#[fg={TAB_NAME}]{}",
+                        tab.position + 1,
+                        name
+                    ));
+                    out.push_str(&bell);
+                    out.push(' ');
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The status glyph, animated for `Running` only. Every other state is a settled
+/// fact and a moving glyph would imply otherwise.
+fn status_glyph(status: Status, glyphs: GlyphSet, frame: usize) -> String {
+    if status == Status::Running {
+        zj_radar_core::status::working_spin(frame).to_string()
+    } else {
+        status.glyph_for(glyphs).to_string()
+    }
+}
+
+/// A bell marker for the tab. Flashing (the transient 400ms state) is louder
+/// than a settled unacknowledged bell, so it gets the error colour.
+fn bell_glyph(tab: &TabView) -> String {
+    if tab.flashing_bell {
+        format!("#[fg={}]󰂚", role_hex(Role::Error))
+    } else if tab.bell {
+        format!("#[fg={}]󰂚", role_hex(Role::Attention))
+    } else {
+        String::new()
+    }
+}
+
+fn push_count(out: &mut String, count: usize) {
+    if count > 1 {
+        out.push_str(&count.to_string());
     }
 }
 
@@ -454,6 +635,23 @@ mod tests {
     }
 
     #[test]
+    fn animation_is_on_by_default_and_switchable_off() {
+        assert!(Config::default().animate());
+        for off in ["false", "0", "no", "off"] {
+            let c = Config::from_zellij_config(&BTreeMap::from([(
+                "animate".to_string(),
+                off.to_string(),
+            )]));
+            assert!(!c.animate(), "{off:?} must disable animation");
+        }
+        let c = Config::from_zellij_config(&BTreeMap::from([(
+            "animate".to_string(),
+            "true".to_string(),
+        )]));
+        assert!(c.animate());
+    }
+
+    #[test]
     fn config_reads_every_key_and_falls_back_on_junk() {
         let config = Config::from_zellij_config(&BTreeMap::from([
             ("pipe_name".to_string(), "pipe_custom".to_string()),
@@ -524,6 +722,141 @@ mod tests {
         after.restore(&before.snapshot(), 0);
         assert!(!after.expire(DEFAULT_TTL_TICKS - 1, &config));
         assert!(after.expire(DEFAULT_TTL_TICKS, &config));
+    }
+
+    fn tab(position: usize, name: &str, active: bool) -> TabView {
+        TabView {
+            position,
+            name: name.into(),
+            active,
+            bell: false,
+            flashing_bell: false,
+        }
+    }
+
+    fn in_tab(pairs: &[(u32, usize)]) -> HashMap<u32, usize> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_tab_without_an_agent_keeps_the_stock_look() {
+        let out = Agents::default().render_tabs(&[tab(0, "notes", false)], &HashMap::new(), nerd(), 0);
+        assert!(out.contains("notes"), "{out:?}");
+        assert!(out.contains("1:"), "index shown for plain tabs: {out:?}");
+        assert!(!out.contains('│'), "no agent separator on a plain tab: {out:?}");
+    }
+
+    #[test]
+    fn an_agents_tab_shows_vendor_status_separator_and_name() {
+        let mut agents = Agents::default();
+        agents.apply(&payload(4, "codex", Status::Pending), 0);
+        let out = agents.render_tabs(&[tab(0, "build", false)], &in_tab(&[(4, 0)]), nerd(), 0);
+        assert!(out.contains(Kind::Codex.mark(nerd())), "vendor icon: {out:?}");
+        assert!(out.contains(Status::Pending.glyph_for(nerd())), "status: {out:?}");
+        assert!(out.contains('│'), "separator: {out:?}");
+        assert!(out.contains("build"), "tab name: {out:?}");
+    }
+
+    #[test]
+    fn a_running_agent_animates_and_other_states_do_not() {
+        let mut running = Agents::default();
+        running.apply(&payload(1, "claude", Status::Running), 0);
+        let map = in_tab(&[(1, 0)]);
+        let frames: Vec<String> = (0..4)
+            .map(|f| running.render_tabs(&[tab(0, "t", false)], &map, nerd(), f))
+            .collect();
+        assert!(
+            frames.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "the working glyph must change between frames: {frames:?}"
+        );
+
+        let mut pending = Agents::default();
+        pending.apply(&payload(1, "claude", Status::Pending), 0);
+        let a = pending.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0);
+        let b = pending.render_tabs(&[tab(0, "t", false)], &map, nerd(), 9);
+        assert_eq!(a, b, "a settled state must not animate");
+    }
+
+    #[test]
+    fn any_running_drives_the_animation_cadence() {
+        let mut agents = Agents::default();
+        assert!(!agents.any_running());
+        agents.apply(&payload(1, "claude", Status::Pending), 0);
+        assert!(!agents.any_running(), "pending is settled, not working");
+        agents.apply(&payload(2, "codex", Status::Running), 0);
+        assert!(agents.any_running());
+    }
+
+    #[test]
+    fn the_active_tab_takes_the_status_colour_as_its_background() {
+        let mut agents = Agents::default();
+        agents.apply(&payload(1, "claude", Status::Error), 0);
+        let out = agents.render_tabs(&[tab(0, "t", true)], &in_tab(&[(1, 0)]), nerd(), 0);
+        assert!(out.contains("bg=#F7768E"), "error bg on the active tab: {out:?}");
+    }
+
+    #[test]
+    fn agents_are_attributed_to_their_own_tab_only() {
+        let mut agents = Agents::default();
+        agents.apply(&payload(1, "claude", Status::Error), 0);
+        let tabs = [tab(0, "left", false), tab(1, "right", false)];
+        // pane 1 lives in tab 1, so tab 0 must stay clean.
+        let out = agents.render_tabs(&tabs, &in_tab(&[(1, 1)]), nerd(), 0);
+        let mark = Kind::Claude.mark(nerd());
+        assert_eq!(out.matches(mark).count(), 1, "exactly one tab decorated: {out:?}");
+        // The decoration must sit in tab 1's segment, i.e. after tab 0's name.
+        let after_left = out.find("left").unwrap();
+        assert!(out.find(mark).unwrap() > after_left, "leaked into tab 0: {out:?}");
+        assert!(out.contains("1:"), "tab 0 keeps its plain index: {out:?}");
+    }
+
+    #[test]
+    fn a_tab_with_two_agents_shows_the_worst_status_and_a_count() {
+        let mut agents = Agents::default();
+        agents.apply(&payload(1, "claude", Status::Running), 0);
+        agents.apply(&payload(2, "claude", Status::Error), 0);
+        let out = agents.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0), (2, 0)]), nerd(), 0);
+        assert!(out.contains(Status::Error.glyph_for(nerd())), "worst status: {out:?}");
+        assert!(out.contains('2'), "count: {out:?}");
+    }
+
+    #[test]
+    fn bells_render_and_a_flash_is_louder_than_a_settled_bell() {
+        let mut t = tab(0, "t", false);
+        t.bell = true;
+        let settled = Agents::default().render_tabs(&[t.clone()], &HashMap::new(), nerd(), 0);
+        assert!(settled.contains("#E0AF68"), "settled bell in attention: {settled:?}");
+
+        t.flashing_bell = true;
+        let flashing = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
+        assert!(flashing.contains("#F7768E"), "flash in error: {flashing:?}");
+    }
+
+    #[test]
+    fn a_tab_with_no_bell_gets_no_bell_glyph() {
+        let out = Agents::default().render_tabs(&[tab(0, "t", false)], &HashMap::new(), nerd(), 0);
+        assert!(!out.contains('\u{f009a}'), "{out:?}");
+    }
+
+    #[test]
+    fn the_tab_strip_never_contains_a_newline() {
+        // zjstatus reads '\n' as a directive separator, so one here would corrupt
+        // the widget — and this string is published alongside a second directive.
+        let mut agents = Agents::default();
+        agents.apply(&payload(1, "omp", Status::Running), 0);
+        let mut t = tab(0, "a\nb", true);
+        t.bell = true;
+        let out = agents.render_tabs(&[t, tab(1, "x", false)], &in_tab(&[(1, 0)]), nerd(), 3);
+        assert!(!out.contains('\n'), "{out:?}");
+    }
+
+    #[test]
+    fn sibling_widget_payload_is_addressed_by_suffix() {
+        let config = Config::default();
+        assert_eq!(
+            config.pipe_payload_for("tabs", "X"),
+            "zjstatus::pipe::pipe_agents_tabs::X"
+        );
     }
 
     #[test]

@@ -7,22 +7,27 @@
 
 #[cfg(target_arch = "wasm32")]
 mod plugin {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use zellij_tile::prelude::*;
-    use zj_radar_agents::{Agents, Config};
+    use zj_radar_agents::{Agents, Config, TabView};
     use zj_radar_core::{parse, STATUS_PIPE_NAME};
 
-    /// Frequency of the one timer this plugin keeps armed. There is no animation
-    /// to drive — the status glyphs are static — so this exists only to (a) age
-    /// entries out and (b) carry the publish that `pipe` deliberately defers,
-    /// which is why it is sub-second: an agent hook must reach the bar in well
-    /// under a second.
-    const TICK_SECS: f64 = 0.25;
+    /// Frame clock while something is working: the spinner needs this to move,
+    /// and the 400ms bell flash needs it to be visible at all.
+    ///
+    /// Deliberately 5 Hz, not the old sidebar's 8 Hz. That sidebar animated
+    /// in-process; here every frame is an IPC broadcast plus a full zjstatus
+    /// repaint (its pipe widgets bypass the widget cache), which measured
+    /// 14-20% server CPU at 8 Hz versus ~6% here — for an animation the eye
+    /// cannot tell apart.
+    const FAST_SECS: f64 = 0.2;
 
-    /// Ticks per wall-clock second, for converting the tick counter into the
-    /// seconds that `Agents::expire` reasons about.
-    const TICKS_PER_SEC: u64 = 4;
+    /// Frame clock when nothing is animating. Still sub-second, because it also
+    /// carries the publish that `pipe` deliberately defers — an agent hook must
+    /// reach the bar in well under a second — but slow enough that an idle
+    /// session is not doing 8 broadcasts every second forever.
+    const IDLE_SECS: f64 = 0.5;
 
     /// Where to mirror live state, or `None` if nothing is writable (in which
     /// case reload-survival is simply off — never a startup failure).
@@ -59,7 +64,17 @@ mod plugin {
     pub struct AgentsPlugin {
         config: Config,
         agents: Agents,
-        tick: u64,
+        /// Wall-clock seconds since load, accumulated from `Event::Timer`'s own
+        /// elapsed value. Kept separate from `frame` so TTLs stay correct no
+        /// matter which cadence the timer is running at.
+        elapsed: f64,
+        /// Spinner frame, advanced once per fast tick.
+        frame: usize,
+        /// Tabs as of the last `TabUpdate`: names, which is active, and bells.
+        tabs: Vec<TabView>,
+        /// Which tab each terminal pane lives in, from the last `PaneUpdate`.
+        /// This is what turns a per-pane agent status into a per-tab indicator.
+        pane_tab: HashMap<u32, usize>,
         /// Plugin pane ids seen in the last `PaneUpdate`. A new id means a new
         /// zjstatus instance (a new tab), which starts with an empty widget and
         /// must be seeded without waiting for the next agent event.
@@ -94,7 +109,14 @@ mod plugin {
                 PermissionType::ReadApplicationState,
                 PermissionType::MessageAndLaunchOtherPlugins,
             ]);
-            subscribe(&[EventType::PaneUpdate, EventType::Timer]);
+            // TabUpdate carries tab names, which tab is active, and the bell
+            // flags; PaneUpdate says which tab each pane is in. Together they
+            // turn per-pane agent status into a per-tab indicator.
+            subscribe(&[
+                EventType::TabUpdate,
+                EventType::PaneUpdate,
+                EventType::Timer,
+            ]);
 
             // Reload survival. Zellij can reload this plugin mid-session, and
             // producers only emit on a status CHANGE — so without this, an agent
@@ -114,20 +136,34 @@ mod plugin {
                 self.snapshot_path = Some(path);
             }
 
-            set_timeout(TICK_SECS);
+            set_timeout(IDLE_SECS);
         }
 
         fn update(&mut self, event: Event) -> bool {
             match event {
-                Event::Timer(_) => {
-                    self.tick += 1;
-                    let expired = self.agents.expire(self.tick / TICKS_PER_SEC, &self.config);
-                    if self.dirty || expired {
-                        self.dirty = false;
-                        self.publish();
+                Event::Timer(late) => {
+                    // Zellij reports how late the callback fired, not which
+                    // duration it belonged to, so accumulate its elapsed value
+                    // rather than counting ticks: TTLs then stay correct across
+                    // a cadence change.
+                    self.elapsed += late.max(0.0);
+                    let animating = self.animating();
+                    if animating {
+                        self.frame = self.frame.wrapping_add(1);
                     }
-                    set_timeout(TICK_SECS);
+                    let expired = self.agents.expire(self.elapsed as u64, &self.config);
+                    let state_changed = self.dirty || expired;
+                    if state_changed || animating {
+                        self.dirty = false;
+                        // On a pure animation frame only the spinner moved, so
+                        // send just the tab strip: the roll-up is unchanged and
+                        // re-sending it would make zjstatus re-process a second
+                        // widget 5 times a second for nothing.
+                        self.publish(!state_changed);
+                    }
+                    set_timeout(if animating { FAST_SECS } else { IDLE_SECS });
                 }
+                Event::TabUpdate(tabs) => self.tabs_changed(tabs),
                 Event::PaneUpdate(manifest) => self.panes_changed(manifest),
                 _ => {}
             }
@@ -159,7 +195,7 @@ mod plugin {
             }
             if let Some(raw) = message.payload.as_deref() {
                 if let Some(payload) = parse(raw) {
-                    if self.agents.apply(&payload, self.tick / TICKS_PER_SEC) {
+                    if self.agents.apply(&payload, self.elapsed as u64) {
                         self.dirty = true;
                     }
                 }
@@ -171,17 +207,50 @@ mod plugin {
     }
 
     impl AgentsPlugin {
+        /// Whether the bar must keep repainting: a working spinner to advance, or
+        /// a bell mid-flash. Everything else is a settled picture that only needs
+        /// redrawing when it changes.
+        fn animating(&self) -> bool {
+            self.config.animate()
+                && (self.agents.any_running() || self.tabs.iter().any(|t| t.flashing_bell))
+        }
+
+        fn tabs_changed(&mut self, tabs: Vec<TabInfo>) {
+            let next: Vec<TabView> = tabs
+                .into_iter()
+                .map(|t| TabView {
+                    position: t.position,
+                    name: t.name,
+                    active: t.active,
+                    bell: t.has_bell_notification,
+                    flashing_bell: t.is_flashing_bell,
+                })
+                .collect();
+            if next != self.tabs {
+                self.tabs = next;
+                self.dirty = true;
+            }
+        }
+
         fn panes_changed(&mut self, manifest: PaneManifest) {
             let mut live_terminals = HashSet::new();
             let mut plugin_panes = HashSet::new();
-            for panes in manifest.panes.values() {
+            let mut pane_tab = HashMap::new();
+            for (tab_position, panes) in &manifest.panes {
                 for pane in panes {
                     if pane.is_plugin {
                         plugin_panes.insert(pane.id);
                     } else {
                         live_terminals.insert(pane.id);
+                        pane_tab.insert(pane.id, *tab_position);
                     }
                 }
+            }
+            if pane_tab != self.pane_tab {
+                // A pane moved tabs, or one appeared/vanished: the strip changes
+                // even when no agent status did.
+                self.pane_tab = pane_tab;
+                self.dirty = true;
             }
 
             if self.agents.retain_panes(&live_terminals) {
@@ -199,9 +268,24 @@ mod plugin {
 
         /// The ONE place that talks to other plugins. Reached only from the
         /// `Timer` arm, never from `pipe` — see `pipe` for why that matters.
-        fn publish(&mut self) {
+        fn publish(&mut self, tabs_only: bool) {
             self.persist();
-            let payload = self.config.pipe_payload(&self.agents.render(self.config.glyphs()));
+            let glyphs = self.config.glyphs();
+            // Both widgets in ONE message: zjstatus's protocol treats '\n' as a
+            // directive separator, so a single broadcast updates the per-tab strip
+            // and the right-hand roll-up together. (The *content* of each widget
+            // must still be newline-free, or it would be read as a directive.)
+            let tabs = self.config.pipe_payload_for(
+                "tabs",
+                &self
+                    .agents
+                    .render_tabs(&self.tabs, &self.pane_tab, glyphs, self.frame),
+            );
+            let payload = if tabs_only {
+                tabs
+            } else {
+                format!("{tabs}\n{}", self.config.pipe_payload(&self.agents.render(glyphs)))
+            };
             if self.last_published.as_deref() == Some(payload.as_str()) {
                 return;
             }
