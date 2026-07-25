@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zj_radar_core::status::{GlyphSet, Role};
-use zj_radar_core::{Kind, Status, StatusPayload};
+use zj_radar_core::{parse, to_wire, Kind, Status, StatusPayload};
 
 /// The zjstatus widget key. It includes the `pipe_` prefix on purpose: zjstatus
 /// derives its map key by stripping only the trailing `_format` / `_rendermode`
@@ -141,6 +141,57 @@ impl Agents {
         self.entries.len() != before
     }
 
+    /// Serialize live observations so they survive a plugin reload.
+    ///
+    /// Zellij reloads a plugin (and wipes its memory) without telling producers,
+    /// and producers only emit on a status *change* — so an agent that has been
+    /// "running" for ten minutes would leave the bar blank until it next changed
+    /// state. That is the whole reason this exists.
+    ///
+    /// The format is one `zj_radar.status.v1` line per pane, i.e. exactly the
+    /// wire contract, so `restore` is just the read path already used for live
+    /// payloads and no second schema can drift from it.
+    pub fn snapshot(&self) -> String {
+        let mut lines: Vec<(u32, String)> = self
+            .entries
+            .iter()
+            .map(|(pane_id, entry)| {
+                (
+                    *pane_id,
+                    to_wire(&StatusPayload {
+                        pane_id: *pane_id,
+                        status: entry.status,
+                        source: entry.kind.as_source().to_string(),
+                        ..Default::default()
+                    }),
+                )
+            })
+            .collect();
+        // Sorted so an unchanged set serializes byte-identically and the
+        // caller can skip the write.
+        lines.sort_by_key(|(pane_id, _)| *pane_id);
+        lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Rebuild from `snapshot`. Unparseable lines are skipped rather than
+    /// failing the whole restore: a partially-written or older-format file must
+    /// degrade to "fewer agents shown", never to a plugin that cannot start.
+    ///
+    /// `now` stamps every restored entry, so TTLs restart from the reload. The
+    /// alternative — persisting timestamps — would expire entries against a
+    /// tick counter that resets on reload, which is worse than restarting them.
+    pub fn restore(&mut self, snapshot: &str, now: u64) {
+        for line in snapshot.lines().filter(|l| !l.trim().is_empty()) {
+            if let Some(payload) = parse(line) {
+                self.apply(&payload, now);
+            }
+        }
+    }
+
     /// Drop observations that have gone quiet for longer than their TTL.
     pub fn expire(&mut self, now: u64, config: &Config) -> bool {
         let before = self.entries.len();
@@ -235,6 +286,14 @@ mod tests {
 
     fn nerd() -> GlyphSet {
         GlyphSet::Nerd
+    }
+
+    impl Agents {
+        fn default_with(payload: &StatusPayload) -> Agents {
+            let mut agents = Agents::default();
+            agents.apply(payload, 0);
+            agents
+        }
     }
 
     #[test]
@@ -406,6 +465,65 @@ mod tests {
         assert_eq!(config.glyphs(), GlyphSet::Nerd);
         assert_eq!(config.ttl_ticks, 42);
         assert_eq!(config.done_ttl_ticks, DEFAULT_DONE_TTL_TICKS);
+    }
+
+    #[test]
+    fn snapshot_round_trips_every_vendor_and_status() {
+        let mut before = Agents::default();
+        before.apply(&payload(0, "omp", Status::Running), 5);
+        before.apply(&payload(1, "codex", Status::Pending), 5);
+        before.apply(&payload(2, "claude", Status::Error), 5);
+
+        let mut after = Agents::default();
+        after.restore(&before.snapshot(), 0);
+
+        assert_eq!(
+            after.render(nerd()),
+            before.render(nerd()),
+            "a reload must reproduce the same bar"
+        );
+    }
+
+    #[test]
+    fn snapshot_of_an_empty_registry_restores_to_empty() {
+        let mut after = Agents::default();
+        after.restore(&Agents::default().snapshot(), 0);
+        assert!(after.is_empty());
+        assert_eq!(after.render(nerd()), "");
+    }
+
+    #[test]
+    fn snapshot_is_stable_for_an_unchanged_set() {
+        // The writer skips unchanged content, so serialization must not depend
+        // on HashMap iteration order or it would rewrite the file constantly.
+        let mut agents = Agents::default();
+        agents.apply(&payload(7, "codex", Status::Running), 0);
+        agents.apply(&payload(2, "claude", Status::Pending), 0);
+        agents.apply(&payload(5, "omp", Status::Error), 0);
+        let first = agents.snapshot();
+        for _ in 0..20 {
+            assert_eq!(agents.snapshot(), first);
+        }
+    }
+
+    #[test]
+    fn restore_skips_junk_lines_instead_of_failing() {
+        let mut agents = Agents::default();
+        let good = Agents::default_with(&payload(1, "claude", Status::Running));
+        let mixed = format!("not json\n\n{}\n{{\"v\":1}}\n", good.snapshot());
+        agents.restore(&mixed, 0);
+        assert!(agents.render(nerd()).contains(Kind::Claude.mark(nerd())));
+    }
+
+    #[test]
+    fn restored_entries_expire_from_the_reload_not_from_never() {
+        let config = Config::default();
+        let mut before = Agents::default();
+        before.apply(&payload(1, "claude", Status::Running), 0);
+        let mut after = Agents::default();
+        after.restore(&before.snapshot(), 0);
+        assert!(!after.expire(DEFAULT_TTL_TICKS - 1, &config));
+        assert!(after.expire(DEFAULT_TTL_TICKS, &config));
     }
 
     #[test]

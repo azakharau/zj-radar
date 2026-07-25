@@ -24,6 +24,37 @@ mod plugin {
     /// seconds that `Agents::expire` reasons about.
     const TICKS_PER_SEC: u64 = 4;
 
+    /// Where to mirror live state, or `None` if nothing is writable (in which
+    /// case reload-survival is simply off — never a startup failure).
+    ///
+    /// `/cache` is scoped by plugin URL, so it is stable across reloads within a
+    /// session. `/data` is NOT: it resolves per instance (`…/<plugin_id>-<client_id>/`),
+    /// so a reload that lands a new plugin id would never find yesterday's file —
+    /// which is the entire point of writing one. `/tmp/zj-radar` is the fallback
+    /// when `/cache` is absent.
+    ///
+    /// The filename carries `zellij_pid` because `/cache` is shared across
+    /// sessions and pane ids are session-scoped: replaying another session's
+    /// panes would show agents that do not exist here.
+    fn snapshot_path(zellij_pid: u32) -> Option<std::path::PathBuf> {
+        let file = format!("state-{zellij_pid}.v1");
+        for root in ["/cache", "/tmp/zj-radar"] {
+            let root = std::path::Path::new(root);
+            if !root.is_dir() && std::fs::create_dir_all(root).is_err() {
+                continue;
+            }
+            // Prove writability now rather than discovering it on every tick —
+            // but probe with a SEPARATE name: writing the real file here would
+            // truncate the snapshot we are about to read back.
+            let probe = root.join(format!("{file}.probe"));
+            if std::fs::write(&probe, b"ok").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return Some(root.join(&file));
+            }
+        }
+        None
+    }
+
     #[derive(Default)]
     pub struct AgentsPlugin {
         config: Config,
@@ -43,6 +74,11 @@ mod plugin {
         /// drained by the next `Timer`; see `pipe` for why the publish cannot
         /// happen inline.
         dirty: bool,
+        /// Where live state is mirrored so it survives a plugin reload, and the
+        /// last content written there (to avoid rewriting an unchanged file four
+        /// times a second).
+        snapshot_path: Option<std::path::PathBuf>,
+        last_snapshot: Option<String>,
     }
 
     impl ZellijPlugin for AgentsPlugin {
@@ -59,6 +95,25 @@ mod plugin {
                 PermissionType::MessageAndLaunchOtherPlugins,
             ]);
             subscribe(&[EventType::PaneUpdate, EventType::Timer]);
+
+            // Reload survival. Zellij can reload this plugin mid-session, and
+            // producers only emit on a status CHANGE — so without this, an agent
+            // that has been "running" for ten minutes leaves the bar blank until
+            // it next changes state. Keyed by `zellij_pid` because pane ids are
+            // session-scoped: replaying another session's panes would show
+            // agents that aren't there.
+            let ids = get_plugin_ids();
+            if let Some(path) = snapshot_path(ids.zellij_pid) {
+                if let Ok(saved) = std::fs::read_to_string(&path) {
+                    self.agents.restore(&saved, 0);
+                    self.last_snapshot = Some(self.agents.snapshot());
+                    // Publish on the first tick so a reload repaints the bar
+                    // immediately rather than waiting for the next agent event.
+                    self.dirty = true;
+                }
+                self.snapshot_path = Some(path);
+            }
+
             set_timeout(TICK_SECS);
         }
 
@@ -145,6 +200,7 @@ mod plugin {
         /// The ONE place that talks to other plugins. Reached only from the
         /// `Timer` arm, never from `pipe` — see `pipe` for why that matters.
         fn publish(&mut self) {
+            self.persist();
             let payload = self.config.pipe_payload(&self.agents.render(self.config.glyphs()));
             if self.last_published.as_deref() == Some(payload.as_str()) {
                 return;
@@ -157,6 +213,23 @@ mod plugin {
                 MessageToPlugin::new("zj-radar-agents").with_payload(payload.clone()),
             );
             self.last_published = Some(payload);
+        }
+
+        /// Mirror live state to disk for the next load. Skipped when unchanged,
+        /// so an idle session does no I/O even though the timer runs at 4 Hz.
+        /// A write failure is deliberately ignored: losing reload-survival is a
+        /// far smaller problem than a plugin that stops reporting agents.
+        fn persist(&mut self) {
+            let Some(path) = self.snapshot_path.as_ref() else {
+                return;
+            };
+            let snapshot = self.agents.snapshot();
+            if self.last_snapshot.as_deref() == Some(snapshot.as_str()) {
+                return;
+            }
+            if std::fs::write(path, &snapshot).is_ok() {
+                self.last_snapshot = Some(snapshot);
+            }
         }
     }
 }
