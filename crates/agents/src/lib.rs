@@ -35,14 +35,18 @@ pub const DEFAULT_DONE_TTL_TICKS: u64 = 30;
 
 /// Frame interval for the working spinner, in milliseconds.
 ///
-/// 80ms x 10 frames is the exact 800ms cycle of `cli-spinners`' `dots`, which is
-/// what ora/Ink and the agent harnesses animate — so the bar spins in step with
-/// the harness's own spinner rather than near it.
+/// 250ms x 8 frames is a 2s cycle. Calmer than `cli-spinners`' native 80ms on
+/// purpose — a status bar is glanced at, not watched — but the value is also
+/// MEASURED, not chosen by feel: at 150ms and 200ms the bar visibly rendered only
+/// every OTHER frame (4 of 8, repeatably), because publishing outpaced the actual
+/// repaint and the extra frames were dropped. 250ms is the fastest interval at
+/// which all eight frames reach the screen, so it is both smoother and cheaper
+/// than the faster settings that appeared to skip.
 ///
 /// It is not free: every frame is an IPC broadcast plus a full zjstatus repaint,
 /// because zjstatus exempts pipe widgets from its widget cache. Raise
 /// `animate_ms` to spend less, or set `animate false` for a static glyph.
-pub const DEFAULT_ANIMATE_MS: u64 = 80;
+pub const DEFAULT_ANIMATE_MS: u64 = 250;
 
 /// Clamp: below this the bar is pure overhead, above it the animation stutters.
 const MIN_ANIMATE_MS: u64 = 50;
@@ -168,6 +172,9 @@ pub struct TabView {
     /// `TabInfo::is_fullscreen_active` — a pane is zoomed, so the tab is hiding
     /// its siblings.
     pub fullscreen: bool,
+    /// `TabInfo::viewport_columns` — how wide the bar is, so the strip can bound
+    /// itself instead of wrapping the whole bar onto a second line.
+    pub columns: usize,
 }
 
 /// Tokyo Night palette, matching the hand-written zjstatus config this replaces
@@ -182,6 +189,33 @@ const TAB_DIM: &str = "#565F89";
 /// font already renders nerd glyphs (see `U+E795` in their `format_right`).
 const DIVIDER: char = '\u{e0b1}';
 const INK: &str = "#222436";
+
+/// Share of the bar the tab strip may occupy. The rest is reserved for
+/// `format_right` (CPU, memory, clock, session). Without a bound the strip grows
+/// with the tab count and pushes the right-hand side onto a SECOND LINE, wrapping
+/// the whole bar — zjstatus's stock `{tabs}` truncates, and taking it over means
+/// taking on that job too.
+const STRIP_WIDTH_SHARE: usize = 55;
+
+/// Printable width of a rendered segment, ignoring `#[...]` colour directives —
+/// they cost bytes but no columns.
+fn visible_width(s: &str) -> usize {
+    let mut w = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '#' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d == ']' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Braille, nerd glyphs and box drawing all occupy one cell here.
+        w += 1;
+    }
+    w
+}
 
 /// Live agent observations, keyed by `(terminal pane id, vendor)`.
 ///
@@ -373,9 +407,16 @@ impl Agents {
         pane_tab: &HashMap<u32, usize>,
         glyphs: GlyphSet,
         frame: usize,
+        bar_columns: usize,
     ) -> String {
-        let mut out = String::new();
+        let budget = if bar_columns == 0 {
+            usize::MAX
+        } else {
+            bar_columns * STRIP_WIDTH_SHARE / 100
+        };
+        let mut segments: Vec<(bool, String)> = Vec::new();
         for tab in tabs {
+            let mut out = String::new();
             // Tab names are user-controlled and reach us verbatim from Zellij. A
             // newline would be read as a zjstatus directive separator (this
             // string is published alongside a second directive), and an escape
@@ -434,25 +475,68 @@ impl Agents {
                 out.push_str(&bell_glyph(tab));
                 out.push(' ');
             }
+            segments.push((tab.active, out));
         }
-        out
+        fit_to_width(segments, budget)
     }
 }
 
-/// Working spinner: `cli-spinners`' `dots` set — a 3x2 dot ring inside ONE
-/// braille cell, rotating.
+/// Drop whole tabs until the strip fits, never the active one, and say how many
+/// were hidden. Truncating mid-segment would cut a colour directive in half and
+/// bleed styling across the rest of the bar.
+fn fit_to_width(segments: Vec<(bool, String)>, budget: usize) -> String {
+    let total: usize = segments.iter().map(|(_, s)| visible_width(s)).sum();
+    if total <= budget {
+        return segments.into_iter().map(|(_, s)| s).collect();
+    }
+    let active = segments.iter().position(|(a, _)| *a).unwrap_or(0);
+    let mut keep = vec![false; segments.len()];
+    keep[active] = true;
+    let mut used = visible_width(&segments[active].1);
+    // Grow outwards from the active tab: its neighbours are the ones you are
+    // most likely to switch to.
+    for step in 1..segments.len() {
+        for idx in [active.checked_sub(step), active.checked_add(step)]
+            .into_iter()
+            .flatten()
+            .filter(|i| *i < segments.len())
+        {
+            let w = visible_width(&segments[idx].1);
+            // +4 leaves room for the "+N" marker.
+            if used + w + 4 <= budget {
+                keep[idx] = true;
+                used += w;
+            }
+        }
+    }
+    let hidden = keep.iter().filter(|k| !**k).count();
+    let mut out: String = segments
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|((_, s), _)| s.as_str())
+        .collect();
+    if hidden > 0 {
+        out.push_str(&format!("#[fg={TAB_DIM},bg={BG}]+{hidden} "));
+    }
+    out
+}
+
+/// Working spinner: `cli-spinners`' `dots9` set — a full-height 4x2 ring inside
+/// ONE braille cell, rotating.
 ///
-/// This is the spinner ora/Ink render, so the agent harnesses themselves show
-/// exactly this animation; matching it is the point. Row 3 of the cell is always
-/// empty, which is what makes it read as a compact 3x2 ring rather than a
-/// full-height block.
+/// Standard set, so it stays consistent with what ora/Ink and the agent harnesses
+/// animate. Chosen over its siblings by weight: `dots` uses only rows 0-2 and 3-4
+/// dots, which is small next to a vendor glyph; `dots2`/`dots13` light 6-7 of 8
+/// dots and read as a solid blob rather than something turning. `dots9` averages
+/// 5 dots across all four rows — full height, clearly a rotating ring.
 ///
-/// Earlier attempts were worse for a reason worth recording: core's
-/// `working_spin` and a hand-built hollow square both spanned TWO cells, so the
-/// motion was spread across eight dot-columns and read as scattered specks next
-/// to a solid vendor glyph. Keeping every frame inside one cell keeps it legible
-/// as a single spinning thing — and halves the width.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Both earlier attempts failed for the same reason and it is worth recording:
+/// core's `working_spin` and a hand-built hollow square each spanned TWO cells, so
+/// the motion was spread over eight dot-columns and read as scattered specks.
+/// Everything staying inside one cell is what makes it legible as a single
+/// spinning thing.
+const SPINNER: [&str; 8] = ["⢹", "⢺", "⢼", "⣸", "⣇", "⡧", "⡗", "⡏"];
 
 /// The status glyph, animated for `Running` only. Every other state is a settled
 /// fact and a moving glyph would imply otherwise.
@@ -536,7 +620,7 @@ mod tests {
 
     fn render_all(agents: &Agents) -> String {
         let map: HashMap<u32, usize> = agents.pane_ids().into_iter().map(|p| (p, 0)).collect();
-        agents.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0)
+        agents.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0, 0)
     }
 
     impl Agents {
@@ -790,6 +874,7 @@ mod tests {
             position,
             name: name.into(),
             active,
+            columns: 0,
             bell: false,
             flashing_bell: false,
             sync: false,
@@ -803,7 +888,7 @@ mod tests {
 
     #[test]
     fn a_tab_without_an_agent_keeps_the_stock_look() {
-        let out = Agents::default().render_tabs(&[tab(0, "notes", false)], &HashMap::new(), nerd(), 0);
+        let out = Agents::default().render_tabs(&[tab(0, "notes", false)], &HashMap::new(), nerd(), 0, 0);
         assert!(out.contains("notes"), "{out:?}");
         assert!(out.contains(" 1 "), "index is always shown \u{2014} navigation is GoToTab <n>: {out:?}");
         for kind in Kind::ALL {
@@ -815,7 +900,7 @@ mod tests {
     fn an_agents_tab_shows_vendor_status_separator_and_name() {
         let mut agents = Agents::default();
         agents.apply(&payload(4, "codex", Status::Pending), 0);
-        let out = agents.render_tabs(&[tab(0, "build", false)], &in_tab(&[(4, 0)]), nerd(), 0);
+        let out = agents.render_tabs(&[tab(0, "build", false)], &in_tab(&[(4, 0)]), nerd(), 0, 0);
         assert!(out.contains(Kind::Codex.mark(nerd())), "vendor icon: {out:?}");
         assert!(out.contains(Status::Pending.glyph_for(nerd())), "status: {out:?}");
         assert!(out.contains(" 1 "), "index still shown alongside the agent: {out:?}");
@@ -834,7 +919,7 @@ mod tests {
         running.apply(&payload(1, "claude", Status::Running), 0);
         let map = in_tab(&[(1, 0)]);
         let frames: Vec<String> = (0..4)
-            .map(|f| running.render_tabs(&[tab(0, "t", false)], &map, nerd(), f))
+            .map(|f| running.render_tabs(&[tab(0, "t", false)], &map, nerd(), f, 0))
             .collect();
         assert!(
             frames.iter().collect::<std::collections::HashSet<_>>().len() > 1,
@@ -843,8 +928,8 @@ mod tests {
 
         let mut pending = Agents::default();
         pending.apply(&payload(1, "claude", Status::Pending), 0);
-        let a = pending.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0);
-        let b = pending.render_tabs(&[tab(0, "t", false)], &map, nerd(), 9);
+        let a = pending.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0, 0);
+        let b = pending.render_tabs(&[tab(0, "t", false)], &map, nerd(), 9, 0);
         assert_eq!(a, b, "a settled state must not animate");
     }
 
@@ -862,7 +947,7 @@ mod tests {
     fn the_active_tab_takes_the_status_colour_as_its_background() {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Error), 0);
-        let out = agents.render_tabs(&[tab(0, "t", true)], &in_tab(&[(1, 0)]), nerd(), 0);
+        let out = agents.render_tabs(&[tab(0, "t", true)], &in_tab(&[(1, 0)]), nerd(), 0, 0);
         assert!(out.contains("bg=#F7768E"), "error bg on the active tab: {out:?}");
     }
 
@@ -872,7 +957,7 @@ mod tests {
         agents.apply(&payload(1, "claude", Status::Error), 0);
         let tabs = [tab(0, "left", false), tab(1, "right", false)];
         // pane 1 lives in tab 1, so tab 0 must stay clean.
-        let out = agents.render_tabs(&tabs, &in_tab(&[(1, 1)]), nerd(), 0);
+        let out = agents.render_tabs(&tabs, &in_tab(&[(1, 1)]), nerd(), 0, 0);
         let mark = Kind::Claude.mark(nerd());
         assert_eq!(out.matches(mark).count(), 1, "exactly one tab decorated: {out:?}");
         // The decoration must sit in tab 1's segment, i.e. after tab 0's name.
@@ -886,7 +971,7 @@ mod tests {
         let mut agents = Agents::default();
         agents.apply(&payload(1, "claude", Status::Running), 0);
         agents.apply(&payload(2, "claude", Status::Error), 0);
-        let out = agents.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0), (2, 0)]), nerd(), 0);
+        let out = agents.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0), (2, 0)]), nerd(), 0, 0);
         assert!(out.contains(Status::Error.glyph_for(nerd())), "worst status: {out:?}");
         assert!(out.contains('2'), "count: {out:?}");
     }
@@ -895,11 +980,11 @@ mod tests {
     fn bells_render_and_a_flash_is_louder_than_a_settled_bell() {
         let mut t = tab(0, "t", false);
         t.bell = true;
-        let settled = Agents::default().render_tabs(&[t.clone()], &HashMap::new(), nerd(), 0);
+        let settled = Agents::default().render_tabs(&[t.clone()], &HashMap::new(), nerd(), 0, 0);
         assert!(settled.contains("#E0AF68"), "settled bell in attention: {settled:?}");
 
         t.flashing_bell = true;
-        let flashing = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
+        let flashing = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0, 0);
         assert!(flashing.contains("#F7768E"), "flash in error: {flashing:?}");
     }
 
@@ -912,7 +997,7 @@ mod tests {
         agents.apply(&payload(2, "codex", Status::Pending), 0);
         let map = in_tab(&[(1, 0), (2, 0)]);
         for active in [true, false] {
-            let out = agents.render_tabs(&[tab(0, "t", active)], &map, nerd(), 0);
+            let out = agents.render_tabs(&[tab(0, "t", active)], &map, nerd(), 0, 0);
             assert!(out.contains(Kind::Claude.mark(nerd())), "claude missing (active={active}): {out:?}");
             assert!(out.contains(Kind::Codex.mark(nerd())), "codex missing (active={active}): {out:?}");
             // Most urgent first: pending outranks running.
@@ -932,7 +1017,7 @@ mod tests {
         agents.apply(&payload(7, "claude", Status::Running), 0);
         agents.apply(&payload(7, "codex", Status::Error), 0);
         agents.apply(&payload(7, "omp", Status::Pending), 0);
-        let out = agents.render_tabs(&[tab(0, "relay", false)], &in_tab(&[(7, 0)]), nerd(), 0);
+        let out = agents.render_tabs(&[tab(0, "relay", false)], &in_tab(&[(7, 0)]), nerd(), 0, 0);
         for k in [Kind::Claude, Kind::Codex, Kind::Omp] {
             assert!(out.contains(k.mark(nerd())), "{k:?} evicted: {out:?}");
         }
@@ -945,7 +1030,7 @@ mod tests {
         let mut agents = Agents::default();
         agents.apply(&payload(3, "claude", Status::Running), 0);
         agents.apply(&payload(3, "claude", Status::Error), 1);
-        let out = agents.render_tabs(&[tab(0, "t", false)], &in_tab(&[(3, 0)]), nerd(), 0);
+        let out = agents.render_tabs(&[tab(0, "t", false)], &in_tab(&[(3, 0)]), nerd(), 0, 0);
         assert_eq!(out.matches(Kind::Claude.mark(nerd())).count(), 1, "{out:?}");
         assert!(out.contains(Status::Error.glyph_for(nerd())), "latest status wins: {out:?}");
     }
@@ -968,9 +1053,41 @@ mod tests {
         after.restore(&before.snapshot(), 0);
         let map = in_tab(&[(9, 0)]);
         assert_eq!(
-            after.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0),
-            before.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0)
+            after.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0, 0),
+            before.render_tabs(&[tab(0, "t", false)], &map, nerd(), 0, 0)
         );
+    }
+
+    #[test]
+    fn the_strip_never_exceeds_its_width_budget() {
+        // Unbounded growth wrapped the whole bar onto a second line, which is what
+        // zjstatus's stock `{tabs}` truncation exists to prevent.
+        let tabs: Vec<TabView> = (0..12)
+            .map(|i| tab(i, &format!("a-longish-tab-name-{i}"), i == 3))
+            .collect();
+        let out = Agents::default().render_tabs(&tabs, &HashMap::new(), nerd(), 0, 200);
+        let budget = 200 * STRIP_WIDTH_SHARE / 100;
+        assert!(
+            visible_width(&out) <= budget,
+            "strip {} wide exceeds budget {budget}: {out:?}",
+            visible_width(&out)
+        );
+        assert!(out.contains("a-longish-tab-name-3"), "active tab must survive: {out:?}");
+        assert!(out.contains('+'), "hidden tabs must be counted: {out:?}");
+    }
+
+    #[test]
+    fn a_strip_that_fits_is_left_alone() {
+        let tabs = [tab(0, "one", true), tab(1, "two", false)];
+        let out = Agents::default().render_tabs(&tabs, &HashMap::new(), nerd(), 0, 200);
+        assert!(out.contains("one") && out.contains("two"), "{out:?}");
+        assert!(!out.contains('+'), "nothing hidden when it fits: {out:?}");
+    }
+
+    #[test]
+    fn visible_width_ignores_colour_directives() {
+        assert_eq!(visible_width("#[fg=#FFFFFF,bold]ab#[fg=#000000]c"), 3);
+        assert_eq!(visible_width("plain"), 5);
     }
 
     #[test]
@@ -978,7 +1095,7 @@ mod tests {
         // The index is a jump target for `GoToTab <n>`; you cannot jump to the tab
         // you are already on, so showing it there is pure noise.
         let tabs = [tab(0, "here", true), tab(1, "there", false)];
-        let out = Agents::default().render_tabs(&tabs, &HashMap::new(), nerd(), 0);
+        let out = Agents::default().render_tabs(&tabs, &HashMap::new(), nerd(), 0, 0);
         assert!(!out.contains(" 1 "), "active tab must not show its index: {out:?}");
         assert!(out.contains(" 2 "), "inactive tab keeps its index: {out:?}");
     }
@@ -989,7 +1106,7 @@ mod tests {
         agents.apply(&payload(1, "claude", Status::Running), 0);
         let map = in_tab(&[(1, 0)]);
         for active in [true, false] {
-            let out = agents.render_tabs(&[tab(0, "name", active)], &map, nerd(), 0);
+            let out = agents.render_tabs(&[tab(0, "name", active)], &map, nerd(), 0, 0);
             let d = out.find(DIVIDER).expect("divider present");
             assert!(
                 d < out.find("name").unwrap(),
@@ -997,7 +1114,7 @@ mod tests {
             );
         }
         // A tab with no agent has nothing to divide.
-        let plain = Agents::default().render_tabs(&[tab(0, "name", false)], &map, nerd(), 0);
+        let plain = Agents::default().render_tabs(&[tab(0, "name", false)], &map, nerd(), 0, 0);
         assert!(!plain.contains(DIVIDER), "no divider without an agent: {plain:?}");
     }
 
@@ -1008,12 +1125,12 @@ mod tests {
         // exactly the kind of surprise a status bar exists to prevent.
         let mut t = tab(0, "t", false);
         t.sync = true;
-        let out = Agents::default().render_tabs(&[t.clone()], &HashMap::new(), nerd(), 0);
+        let out = Agents::default().render_tabs(&[t.clone()], &HashMap::new(), nerd(), 0, 0);
         assert!(out.contains("[sync]"), "{out:?}");
         assert!(!out.contains("[full]"), "{out:?}");
 
         t.fullscreen = true;
-        let both = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
+        let both = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0, 0);
         assert!(both.contains("[sync]") && both.contains("[full]"), "{both:?}");
     }
 
@@ -1023,36 +1140,43 @@ mod tests {
         // strip would train you to ignore it.
         let mut running = Agents::default();
         running.apply(&payload(1, "claude", Status::Running), 0);
-        let calm = running.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0)]), nerd(), 0);
+        let calm = running.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0)]), nerd(), 0, 0);
         assert!(calm.contains(&format!("#[fg={TAB_NAME}]t")), "{calm:?}");
 
         let mut urgent = Agents::default();
         urgent.apply(&payload(1, "claude", Status::Error), 0);
-        let loud = urgent.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0)]), nerd(), 0);
+        let loud = urgent.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0)]), nerd(), 0, 0);
         assert!(loud.contains(&format!("#[fg={}]t", role_hex(Role::Error))), "{loud:?}");
     }
 
     #[test]
-    fn the_spinner_is_a_single_cell_3x2_ring() {
+    fn the_spinner_is_a_single_cell_full_height_ring() {
+        let mut rows_seen = std::collections::HashSet::new();
         for f in &SPINNER {
             let chars: Vec<char> = f.chars().collect();
             assert_eq!(chars.len(), 1, "frame {f:?} must be ONE cell wide");
             let bits = chars[0] as u32 - 0x2800;
-            // Row 3 (dots 7/8, bits 0x40/0x80) must stay dark: that is what makes
-            // it a compact 3x2 ring instead of a full-height glyph.
-            assert_eq!(bits & 0xC0, 0, "frame {f:?} must not use the bottom row");
-            assert!((3..=4).contains(&bits.count_ones()), "frame {f:?} dot count");
+            // Substantial enough to read as a ring, not so full it looks solid.
+            assert!((4..=6).contains(&bits.count_ones()), "frame {f:?} dot count");
+            for (bit, row) in [
+                (0x01, 0), (0x08, 0), (0x02, 1), (0x10, 1),
+                (0x04, 2), (0x20, 2), (0x40, 3), (0x80, 3),
+            ] {
+                if bits & bit != 0 {
+                    rows_seen.insert(row);
+                }
+            }
         }
-        assert_eq!(SPINNER.len(), 10, "the cli-spinners `dots` cycle");
-        // Consecutive frames must differ or it would not read as motion.
+        assert_eq!(rows_seen.len(), 4, "the ring must use all four rows (4x2)");
+        assert_eq!(SPINNER.len(), 8, "the cli-spinners `dots9` cycle");
         for w in SPINNER.windows(2) {
-            assert_ne!(w[0], w[1]);
+            assert_ne!(w[0], w[1], "consecutive frames must differ");
         }
     }
 
     #[test]
     fn a_tab_with_no_bell_gets_no_bell_glyph() {
-        let out = Agents::default().render_tabs(&[tab(0, "t", false)], &HashMap::new(), nerd(), 0);
+        let out = Agents::default().render_tabs(&[tab(0, "t", false)], &HashMap::new(), nerd(), 0, 0);
         assert!(!out.contains('\u{f009a}'), "{out:?}");
     }
 
@@ -1064,7 +1188,7 @@ mod tests {
         agents.apply(&payload(1, "omp", Status::Running), 0);
         let mut t = tab(0, "a\nb", true);
         t.bell = true;
-        let out = agents.render_tabs(&[t, tab(1, "x", false)], &in_tab(&[(1, 0)]), nerd(), 3);
+        let out = agents.render_tabs(&[t, tab(1, "x", false)], &in_tab(&[(1, 0)]), nerd(), 3, 0);
         assert!(!out.contains('\n'), "{out:?}");
     }
 

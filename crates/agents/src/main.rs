@@ -215,6 +215,7 @@ mod plugin {
                     flashing_bell: t.is_flashing_bell,
                     sync: t.is_sync_panes_active,
                     fullscreen: t.is_fullscreen_active,
+                    columns: t.viewport_columns,
                 })
                 .collect();
             if next != self.tabs {
@@ -267,7 +268,14 @@ mod plugin {
             let payload = self.config.pipe_payload(
                 &self
                     .agents
-                    .render_tabs(&self.tabs, &self.pane_tab, glyphs, self.frame),
+                    .render_tabs(
+                        &self.tabs,
+                        &self.pane_tab,
+                        glyphs,
+                        self.frame,
+                        // The bar spans the whole width; any tab reports it.
+                        self.tabs.first().map_or(0, |t| t.columns),
+                    ),
             );
             if self.last_published.as_deref() == Some(payload.as_str()) {
                 return;
