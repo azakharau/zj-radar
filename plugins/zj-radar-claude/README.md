@@ -1,10 +1,11 @@
 # zj-radar-claude
 
 A Claude Code **plugin** that broadcasts agent status (working / waiting / done)
-to the [zj-radar](../../) Zellij sidebar — with **no `settings.json` editing**.
-Installing the plugin auto-registers the hooks; uninstalling removes them cleanly.
+to [zj-radar](../../)'s `{pipe_agents}` zjstatus widget — with **no
+`settings.json` editing**. Installing the plugin auto-registers the hooks;
+uninstalling removes them cleanly.
 
-This plugin only sends status. Install the Zellij sidebar first with the
+This plugin only sends status. Install the aggregator first with the
 [main install guide](../../docs/install.md), then add this producer.
 
 ## Install
@@ -27,13 +28,13 @@ claude --plugin-dir /path/to/zj-radar/plugins/zj-radar-claude   # session-only
 
 Registers these hooks (all calling the bundled `scripts/notify.sh`):
 
-| Hook | Sidebar status |
-|------|----------------|
+| Hook | Status |
+|------|--------|
 | `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStop` | `running` |
 | `Notification` (`permission_prompt` / `elicitation_dialog` matchers) | `pending` |
-| `Stop` | `done` (clears when the pane returns to its shell prompt, or on the next broadcast) |
-| `SessionStart` (`matcher: clear` only) | `idle` (resets the row on `/clear`) |
-| `SessionEnd` | `idle` (clears the row when the Claude session exits) |
+| `Stop` | `done` (cleared by the aggregator's `done_ttl_secs`, or the next broadcast) |
+| `SessionStart` (`matcher: clear` only) | `idle` (resets the entry on `/clear`) |
+| `SessionEnd` | `idle` (clears the entry when the Claude session exits) |
 
 Each fires a `zellij pipe --name zj_radar.status.v1` broadcast. It is a **no-op
 outside Zellij**, so it's safe to leave enabled everywhere.

@@ -1,10 +1,11 @@
-# Producers — sending agent status to the sidebar
+# Producers — sending agent status to the aggregator
 
-The sidebar is just a display. A **producer** is whatever broadcasts agent
-status to it. zj-radar ships producers for Claude Code and Codex, and the wire
-format is a documented pipe payload so you can write your own.
+The aggregator (`zj-radar-agents`) is just a display, folded through your
+zjstatus bar's `{pipe_agents}` widget. A **producer** is whatever broadcasts
+agent status to it. zj-radar ships producers for Claude Code and Codex, and
+the wire format is a documented pipe payload so you can write your own.
 
-Install the [sidebar](install.md) first, then add a producer below.
+Install [the aggregator](install.md) first, then add a producer below.
 
 ## Claude Code
 
@@ -61,9 +62,10 @@ cargo install zj-radar
 - **`zj-radar setup codex --legacy-notify`** — opt-in fallback for older Codex
   setups that only support the single `notify` program. It refuses to replace a
   foreign notifier unless `--force` is also passed.
-- **`zj-radar setup zellij --wasm <path>`** — copies the sidebar wasm to
-  `~/.config/zellij/plugins/zj_radar.wasm`, manages the `radar` alias in
-  `config.kdl`, and prints the layout snippet. It leaves layouts user-owned.
+
+`setup` has exactly these two targets, `claude` and `codex` — there is no
+`zellij` target. Running the aggregator itself is not something `setup`
+manages; see [`install.md`](install.md).
 
 Codex hooks report turn start, tool use, permission requests, subagents, and
 turn stop. zj-radar maps those to `running`, `pending`, and `done`.
@@ -84,7 +86,8 @@ zj-radar notify generic --status done --msg "deploy finished" --source deploy
   `idle` and erases your row.
 - `--msg`: the activity line. `running` with no msg gets a `working` baseline;
   `idle` always broadcasts blank.
-- `--task`: the sticky task label (empty keeps the stored one).
+- `--task`: the sticky task label. Sent on the wire, but not currently read
+  by the shipped aggregator (see the note on `task`/`ack` below).
 - `--source`: picks the kind mark — `test` ⚗ · `build` ⚙ · `deploy` ⇡ ·
   `server` ❯ · `command` $ — anything else (including the default `generic`)
   renders the neutral `⦿`.
@@ -92,24 +95,26 @@ zj-radar notify generic --status done --msg "deploy finished" --source deploy
   `$ZELLIJ_PANE_ID`. Outside Zellij it's a silent no-op (safe under `set -e`).
   `--dry-run` prints the payload instead of broadcasting.
 
-The same lifecycle rules as agents apply: latest broadcast wins, a finished
-status clears when the pane returns to its shell prompt, and a `running` row
-whose pane sits at the prompt with no follow-up broadcast is cleared by the
-stale-Running watchdog after ~15s — so send `done`/`error` when your script
-finishes rather than leaning on the watchdog.
+The same lifecycle rules as agents apply: latest broadcast wins, and an entry
+is dropped once its pane has gone quiet for `ttl_secs` (default 15 minutes;
+`done` uses the shorter `done_ttl_secs`, default 30s — see
+[`configuration.md`](configuration.md)). There is no return-to-shell-prompt
+auto-clear — the aggregator does not watch pane command activity, only the
+status pipe — so send `done`/`error` promptly when your script finishes
+rather than leaning on the TTL to eventually hide a stale `running`.
 
 ## Writing your own producer
 
 Writing one in Rust? Depend on
 [`zj-radar-core`](https://crates.io/crates/zj-radar-core)
-([docs.rs](https://docs.rs/zj-radar-core)) — the same crate both halves of
-zj-radar use: build a typed `StatusPayload` and serialize it with `to_wire`,
-round-trip-tested against this schema, so your payload can't drift from what
-the sidebar accepts. Everything below applies either way; the crate just
-handles the encoding for you.
+([docs.rs](https://docs.rs/zj-radar-core)) — the same crate both the CLI and
+the aggregator plugin use: build a typed `StatusPayload` and serialize it with
+`to_wire`, round-trip-tested against this schema, so your payload can't drift
+from what the aggregator accepts. Everything below applies either way; the
+crate just handles the encoding for you.
 
-The plugin's only real interface is the versioned pipe payload. Broadcast (by
-name, never `--plugin`) a `zj_radar.status.v1` message:
+The aggregator's only real interface is the versioned pipe payload. Broadcast
+(by name, never `--plugin`) a `zj_radar.status.v1` message:
 
 ```json
 { "v": 1,
@@ -122,33 +127,34 @@ name, never `--plugin`) a `zj_radar.status.v1` message:
   "task": "fix the flaky auth test" }
 ```
 
-- `status`: `running` → working · `pending` → needs-you · `done` · `error` ·
-  `idle` → plain. An **unknown or empty `status` folds to `idle`**, which
-  *clears* the row and resets its sticky task — a typo'd status silently erases
-  the row you meant to update, so validate before broadcasting.
+- `status`: `running` · `pending` · `done` · `error` · `idle`. An **unknown or
+  empty `status` folds to `idle`**, which the aggregator treats the same as
+  `gone` — it *drops* the pane's entry entirely — so a typo'd status silently
+  erases the entry you meant to update; validate before broadcasting.
 - `pane.id`: strip any `terminal_` prefix from `$ZELLIJ_PANE_ID`.
 - `source`: tokens are lowercase-exact — matching is case-sensitive, so
   `"claude"` classifies as the Claude agent while `"Claude"` falls back to the
   neutral kind.
-- `task` (optional, sent only on `UserPromptSubmit`): sticky task label —
-  empty/absent leaves the stored label unchanged, non-empty replaces it; the
-  plugin clears it on idle and on return-to-shell.
-- `ack` (optional, default `false`): "the user has already seen this status" —
-  the plugin converges state as usual but never fires a desktop notification
-  for it. Set by the rail's own right-click acknowledge broadcast; producers
-  reporting real events should leave it absent (an acknowledged `done` would
-  otherwise skip the completion notification the user wanted).
-- Unknown fields are ignored, so it's safe to send extras. (A former `on_focus`
-  clear-on-focus hint is no longer used — the plugin clears a finished status when
-  the pane returns to its shell prompt instead — but sending it does no harm.)
+- `repo`, `branch`, `msg`, `task`, `ack`: part of the durable wire contract —
+  parsed, sanitized, and capped like every other field below — but the
+  shipped `zj-radar-agents` aggregator does not currently track or render any
+  of them: it keys its whole aggregate on `pane_id` + `status` + `source`
+  only (see `crates/agents/src/lib.rs`). Send them anyway if you like (a
+  future or custom consumer of the same pipe could use them), just don't
+  expect today's `{pipe_agents}` widget to show them.
+- Unknown fields (including a legacy `on_focus`) are ignored, so it's safe to
+  send extras.
 
-The plugin applies the latest broadcast per pane (the pipe delivers in order, so
-there is no sequence number). It also defends itself: it strips ANSI/control
-chars and Unicode bidi-control characters, folds newlines to spaces, and
-silently ignores unknown fields, so extra keys never break a producer. The plugin
-also enforces field limits, so you don't have to pre-truncate: `repo`/`branch` are cut to 40 chars,
-`msg`/`task` to 60, `source` to 16 — and a payload over **64 KB** is dropped
-whole. `pane.type` must be `"terminal"`; any other pane type is rejected.
+The aggregator applies the latest broadcast per pane (the pipe delivers in
+order, so there is no sequence number) and drops a pane's entry once it has
+gone quiet for `ttl_secs` — see [`configuration.md`](configuration.md). The
+wire parser (`zj-radar-core`, shared by every consumer) also defends against
+malformed input: it strips ANSI/control chars and Unicode bidi-control
+characters, folds newlines to spaces, and silently ignores unknown fields, so
+extra keys never break a producer. It also enforces field limits, so you
+don't have to pre-truncate: `repo`/`branch` are cut to 40 chars, `msg`/`task`
+to 60, `source` to 16 — and a payload over **64 KB** is dropped whole.
+`pane.type` must be `"terminal"`; any other pane type is rejected.
 
 Quick smoke test (a "fake agent" — broadcast straight from your shell):
 
@@ -159,13 +165,15 @@ zellij pipe --name zj_radar.status.v1 -- \
 
 **Bound your sends.** `zellij pipe` is not fire-and-forget: Zellij holds the
 client process until *every* loaded plugin instance consumes the message
-(CLI-pipe backpressure). A plugin instance stuck at its permission prompt
-blocks the client **forever** — and a producer that fires per tool-call then
-leaks one blocked process plus two Zellij-server FDs per event, until the
-server hits EMFILE and the whole session crashes. Wrap the call in a timeout
-(the bundled producers use 5 s, `ZJ_RADAR_PIPE_TIMEOUT` to override); killing
-the client past the deadline loses nothing — the message is already queued
-server-side.
+(CLI-pipe backpressure). There is exactly one recipient now — the headless
+aggregator, loaded once per session — rather than the one-per-tab sidebar
+this replaced, so the blast radius of a stuck recipient is far smaller than it
+used to be. But the same discipline still applies: a producer that fires per
+tool-call with no timeout can still leak a blocked process and Zellij-server
+FDs per event if the recipient is ever unresponsive, until the server hits
+EMFILE. Wrap the call in a timeout (the bundled producers use 5 s,
+`ZJ_RADAR_PIPE_TIMEOUT` to override); killing the client past the deadline
+loses nothing — the message is already queued server-side.
 
 The timeout must survive **your own death**, too. Hook runners kill their
 hooks, and a producer killed mid-send never runs its kill-on-deadline — the

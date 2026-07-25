@@ -1,338 +1,156 @@
-# Installing the sidebar
+# Installing the agent-status widget
 
-This is the full install reference for the **sidebar** — the wasm plugin you add
-to your Zellij layout. For the **producer** (whatever broadcasts agent status),
-see [`producers.md`](producers.md). For a copy-paste fast path, see
+This is the full install reference for the **aggregator** — the headless wasm
+plugin that feeds the `{pipe_agents}` widget in your zjstatus bar. For the
+**producer** (whatever broadcasts agent status to it), see
+[`producers.md`](producers.md). For a copy-paste fast path, see
 [Quick start](../README.md#quick-start).
 
-**Requirements:** Zellij **0.44.3 or newer** — the sidebar is built against the
-0.44 plugin API, and Zellij keeps compiled plugins working on newer releases;
-the floor exists because 0.44 patches before .3 lack the swap-layout fix that
-keeps the sidebar pinned (check with `zellij --version`). `--download`
-additionally needs `curl` or `wget` on PATH.
+**Requirements:** Zellij **0.44.3 or newer** (check with `zellij --version`),
+and [zjstatus](https://github.com/dj95/zjstatus) already declared in your
+`config.kdl` — the aggregator has no pane and no rendering of its own; it only
+publishes a string for zjstatus's `{pipe_agents}` widget to display.
 
-There are two jobs to get a working radar:
+There are two jobs to get a working widget:
 
-1. **Show the sidebar in Zellij** — install the wasm at a stable path, define a
-   `radar` plugin alias in `config.kdl`, and add the sidebar templates to a
-   layout. *(This page.)*
-2. **Send agent status to the sidebar** — install the Claude plugin or wire an
-   agent to call `zj-radar notify`. *(See [`producers.md`](producers.md).)*
+1. **Run the aggregator and wire it into zjstatus** — get the wasm onto disk,
+   add a `load_plugins` entry for it, and add `{pipe_agents}` to your
+   zjstatus `format_right`. *(This page.)*
+2. **Send agent status to it** — install the Claude plugin or wire an agent to
+   call `zj-radar notify`. *(See [`producers.md`](producers.md).)*
 
-## Recommended: install the CLI, then `setup zellij --download`
+This is intentionally **not** something the `zj-radar` CLI installs, injects,
+or manages for you: unlike the old per-tab sidebar, the aggregator is just
+another Zellij plugin declared in *your* `config.kdl`, the same way you'd add
+any other one. There is no `zj-radar setup zellij` — `setup` only wires
+producers (`claude`, `codex`).
 
-A tagged release ships a prebuilt `zj-radar` CLI for Linux (x86_64 and aarch64,
-static musl) and **Apple Silicon** macOS (aarch64). Intel (x86_64) macOS has no
-prebuilt binary — the installer detects it and points you at the source install
-(`cargo install zj-radar`); see [Build from source](#build-from-source-instead).
-Install with the one-line script, then let it fetch the matching sidebar wasm and
-manage the Zellij plugin alias:
+## 1. Get the wasm
+
+### Download a release asset
+
+Tagged releases publish `zj_radar_agents.wasm` (plus a `.sha256` checksum)
+alongside the CLI tarballs:
 
 ```sh
-# Static Linux + macOS binary; installs to ~/.local/bin by default.
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/marktoda/zj-radar/releases/latest/download/install.sh | sh
-
-zj-radar setup zellij --download
+mkdir -p ~/.config/zellij/plugins
+cd ~/.config/zellij/plugins
+curl -fsSLO https://github.com/marktoda/zj-radar/releases/latest/download/zj_radar_agents.wasm
+curl -fsSLO https://github.com/marktoda/zj-radar/releases/latest/download/zj_radar_agents.wasm.sha256
+sha256sum -c zj_radar_agents.wasm.sha256   # macOS: shasum -a 256 -c
 ```
 
-`setup zellij --download`:
-
-- downloads the wasm **built from this CLI's own version** (set `ZJ_RADAR_VERSION`
-  to pin a different release tag) — so the CLI and the sidebar it manages can't
-  drift apart on the status contract and setup expectations they share
-- verifies it against the release's published `.sha256` checksum before installing
-  (a mismatch aborts; releases without a checksum fall back to TLS-only with a
-  warning) — needs `sha256sum` or `shasum` on `PATH`
-- copies it to `~/.config/zellij/plugins/zj_radar.wasm`
-- adds or updates a managed `radar` alias in `~/.config/zellij/config.kdl`
-- reads your default layout, then **prompts** `Inject the rail into <layout>? [y/N]`:
-  answer **y** to splice the rail in-place (backup saved as `.zj-radar.bak`), or
-  **N** (default) to print the tailored snippet to paste yourself
-
-Pass `--inject` for a non-interactive yes, `--layout <name>` to target a specific
-layout (`~/.config/zellij/layouts/<name>.kdl`), `--dry-run` to preview without
-writing, `--yes` for a fully non-interactive run (always takes the safe default —
-prints the snippet, never mutates a layout), and `--force` only if you want to
-replace an existing unmanaged `radar` alias. The installer also honors
-`ZJ_RADAR_VERSION` (release tag) and `ZJ_RADAR_BIN_DIR` (install directory).
-
-## Try it without touching your config (`zj-radar run`)
-
-`zj-radar run` launches a throwaway Zellij session with the rail already wired
-in — it owns its session config, so nothing in your `~/.config/zellij` is read
-or edited. The fine print of that ownership:
-
-- Your own Zellij keybinds and theme don't apply inside `run` sessions.
-- Attaching to a session `run` didn't create asks first.
-- On top of the Zellij defaults, its config binds `Ctrl y` (summon the
-  permission-grant float) and `Alt 1`–`Alt 9` (tab jumps), so those chords
-  won't reach apps inside the panes — readline's yank and emacs's `M-digit`
-  among them.
-- It uses the wasm bundled into the binary; if you installed via
-  `cargo install` (no bundled wasm), it downloads the matching wasm on first
-  use.
-
-## Build from source instead
-
-No prebuilt binary for your platform, or hacking on zj-radar? Build the wasm and
-install the CLI from a checkout, then point `setup zellij` at the local wasm:
+### Build from source instead
 
 ```sh
 git clone https://github.com/marktoda/zj-radar
 cd zj-radar
-
-# Needs the wasm32-wasip1 target; rust-toolchain.toml requests it (rustup
-# auto-installs it). See docs/TOOLCHAIN.md.
-cargo build --release --target wasm32-wasip1 -p zj-radar-plugin
-cargo install --path crates/cli
-
-zj-radar setup zellij --wasm target/wasm32-wasip1/release/zj_radar.wasm
+just install-wasm   # = just build-wasm (cross-compiles to wasm32-wasip1) + copy
+                     #   the artifact to ${ZELLIJ_CONFIG_DIR:-~/.config/zellij}/plugins/
 ```
 
-## Manual setup
+`just build-wasm` needs the `wasm32-wasip1` target; `rust-toolchain.toml`
+requests it, so `rustup` auto-installs it on first build (see
+[`TOOLCHAIN.md`](TOOLCHAIN.md)).
 
-If you are not using the CLI, copy the wasm to the same stable path yourself
-(from a source build, or a `zj_radar.wasm` downloaded from a release):
+### Nix / home-manager
 
-```sh
-mkdir -p ~/.config/zellij/plugins
-cp target/wasm32-wasip1/release/zj_radar.wasm ~/.config/zellij/plugins/
-```
-
-Then define the alias once in `~/.config/zellij/config.kdl`:
-
-```kdl
-// ~/.config/zellij/config.kdl
-plugins {
-    radar location="file:~/.config/zellij/plugins/zj_radar.wasm" {
-        naming "managed"
-    }
-}
-```
-
-The fixed path matters: Zellij ties a plugin's permission grant to its location.
-If the location changes on every rebuild, Zellij asks again.
-
-## Add the sidebar to a layout
-
-The sidebar is a pinned, borderless **left column** that lives in every tab.
-Zellij has no "pin a pane across all tabs" mechanism other than the tab
-templates — the same place its own tab-bar/status-bar live — so radar integrates
-like [zjstatus](https://github.com/dj95/zjstatus): add one pane to your
-templates, and keep the rest of your layout yours.
-
-`setup zellij` with `--wasm <path>` or `--download` installs the wasm and alias,
-then prompts to inject the rail automatically. You can also inject or re-inject
-at any time (no wasm/alias step needed):
-
-```sh
-zj-radar setup zellij --inject              # inject into the default layout
-zj-radar setup zellij --inject --layout my  # inject into layouts/my.kdl
-zj-radar setup zellij --uninstall           # strip the injected rail
-```
-
-No layout file at all (a stock Zellij ships none)? `--inject` — or answering
-`y` at the prompt — creates it outright with the full rail layout instead of
-splicing.
-
-To do it manually, add this snippet to any layout file:
-
-```kdl
-// Tabs defined in the layout file get their panes via `children`.
-default_tab_template {
-    pane split_direction="vertical" {
-        pane size=32 borderless=true { plugin location="radar" }   // ← alias
-        children
-    }
-    pane size=2 borderless=true { plugin location="zellij:status-bar" }
-}
-
-// Tabs created at runtime (Ctrl+t n) get a CONCRETE focused pane, not `children`.
-new_tab_template {
-    pane split_direction="vertical" {
-        pane size=32 borderless=true { plugin location="radar" }
-        pane focus=true
-    }
-    pane size=2 borderless=true { plugin location="zellij:status-bar" }
-}
-```
-
-Why two templates? It works around an upstream Zellij derivation bug — see
-[Can't open a new tab](troubleshooting.md#cant-open-a-new-tab-the-two-template-rule).
-
-One more thing the snippet above does **not** cover: any custom layout makes
-Zellij discard its built-in swap layouts, so `Alt+[` / `Alt+]` cycling stops
-working (and a swap that doesn't include the rail would swap it away). Copy the
-`tab_template name="ui"` + `swap_tiled_layout` blocks from the example layout
-below, or let `--inject` add them — and if your layout already has its own
-swaps, see [swap-layout cycling stops working](troubleshooting.md#alt-hides-the-rail-or-stops-cycling).
-
-Prefer a complete starting layout? Copy
-[`examples/radar-sidebar.kdl`](../examples/radar-sidebar.kdl) to
-`~/.config/zellij/layouts/` and run `zellij --layout radar-sidebar`. It uses the
-same `plugin location="radar"` alias as the snippet.
-
-Want the column on the **right**? Put `children` (and the runtime
-`pane focus=true`) before the radar pane in each vertical split. Different
-width? Change `size`.
-
-## Permissions
-
-Zellij requires an explicit permission grant the first time a plugin loads from
-a given path. The sidebar requests four:
-
-- `ReadApplicationState` — read tab/pane state to draw the rail.
-- `ReadCliPipes` — receive the `zj_radar.status.v1` broadcasts from producers.
-- `ChangeApplicationState` — switch tabs on click and apply managed tab names.
-- `RunCommands` — deliver desktop notifications (`osascript` on macOS,
-  `notify-send` on Linux). This is the only thing the plugin runs commands
-  for; turn notifications off with `notify false` (see
-  [configuration](configuration.md)), and without this grant they are
-  silently skipped while everything else keeps working.
-
-**By default you never meet a prompt for these:** `setup zellij` asks for your
-consent at install time and, if you agree, writes the grant into Zellij's
-`permissions.kdl` itself (merge-safe — other plugins' entries are untouched,
-a `.zj-radar.bak` is left beside the file, and an unparseable file is refused
-rather than edited). Zellij re-reads that file every time a plugin loads, so
-the sidebar comes up live on the next launch — and in already-running
-sessions, on the next new tab or restart. To revoke, edit the
-`zj_radar.wasm` block out of `permissions.kdl`.
-
-## If you skipped the pre-authorization
-
-Declining the install-time consent leaves Zellij's normal first-run flow: on
-first load the sidebar pane hosts Zellij's native y/n prompt. Be warned that
-at rail width that prompt is unreadable — the pane just looks **blank**
-([zellij #4749](https://github.com/zellij-org/zellij/issues/4749)); the rail
-is waiting, not broken. Two ways to grant:
-
-- focus the (blank) rail pane and press `y`, or
-- from inside the session, run `zj-radar setup zellij --grant` — it opens the
-  wasm in a focused **floating pane**, where the same prompt renders legibly.
-  This is a standalone action: it skips wasm copy, alias edit, and layout
-  injection, and exits after launching the pane. Approve there, close it, and
-  every sidebar instance at the same path uses Zellij's cached grant.
-
-After approval, the per-tab sidebars reuse the cached grant. For how the
-per-tab instances coordinate that single prompt (and what happens when session
-files aren't writable), see
-[First-run prompt coordination](troubleshooting.md#first-run-prompt-coordination).
-
-## Check your setup (`--check`)
-
-Run `zj-radar setup zellij --check` to get a diagnostic summary of every
-component:
-
-```
-zj-radar setup zellij --check
-zellij:
-  ok zellij binary: found on PATH (zellij 0.44.3)
-  ok alias: radar plugin alias present in config.kdl
-  ok wasm: wasm plugin file present
-  missing layout: default layout does not have the radar rail — run `zj-radar setup zellij` or paste the snippet
-  missing grant: wasm not granted — run `zj-radar setup zellij -y` to pre-authorize (or `--grant` from inside Zellij)
-  ok producer: Claude plugin wired
-```
-
-Each item is `ok`, `warn`, or `missing`. The check is read-only — it never
-modifies any file. Reported items (six always; a seventh only when applicable):
-
-- **zellij binary** — `zellij` is on `PATH`; warns when its version is below
-  the supported floor of 0.44.3 (earlier 0.44 patches let the sidebar pop out
-  during layout swaps; newer Zellij releases keep compiled plugins working).
-- **alias** — `radar` plugin alias present in `config.kdl`; warns if it points at
-  a `/nix/store/` path (grant won't survive a rebuild).
-- **wasm** — plugin file exists at the expected stable path.
-- **layout** — default layout contains the injected radar rail.
-- **grant** — `permissions.kdl` records a grant for the wasm path.
-- **producer** — Codex hooks and/or Claude plugin wired up (names which).
-- **managed config** — emitted only when `config.kdl` is a symlink
-  (home-manager); warns that direct edits may be overwritten.
-
-## Loading straight from a release URL (caveat)
-
-Zellij can also load a plugin directly from an `https://` URL, downloading and
-caching it (no manual `cp`) — once a release is tagged:
-
-```kdl
-plugin location="https://github.com/marktoda/zj-radar/releases/latest/download/zj_radar.wasm"
-```
-
-**Not recommended as the default for zj-radar**, though: the sidebar loads once
-*per tab* (it lives in `default_tab_template`), and Zellij has a known bug where
-several tabs fetching the same remote plugin at once can corrupt the download.
-Prefer the `file:` path above or the Nix package below; use the URL form only
-for a quick single-tab try.
-
-## Nix / home-manager
-
-This flake exposes the wasm as `packages.default` and the CLI as
-`packages.zj-radar-cli`, so a flake-based config consumes the exact artifacts
-this repo builds. Add the repo as an input:
+The flake exposes the wasm as `packages.default` (alias `packages.zj-radar`)
+and the CLI as `packages.zj-radar-cli`:
 
 ```nix
 # flake.nix
 inputs.zj-radar.url = "github:marktoda/zj-radar";
 ```
 
-Install both halves from the same pin — the CLI must ride along because the
-producer hooks prefer `zj-radar notify` from PATH:
-
 ```nix
 # home-manager module
 home.packages = [inputs.zj-radar.packages.${pkgs.system}.zj-radar-cli];
 
-# Symlink the wasm to a STABLE path rather than pointing the alias at the
+# Symlink to a STABLE path rather than pointing `load_plugins` at the
 # /nix/store path directly: Zellij keys permission grants by the configured
-# location string, so a per-build store path re-prompts after every rebuild
-# (`zj-radar setup zellij --check` warns about exactly this). Rebuilds swap
-# the symlink target; the granted path never changes.
-home.file.".config/zellij/plugins/zj_radar.wasm".source =
-  "${inputs.zj-radar.packages.${pkgs.system}.default}/bin/zj_radar.wasm";
+# location string, so a per-build store path re-prompts after every rebuild.
+# Rebuilds swap the symlink target; the granted path never changes.
+home.file.".config/zellij/plugins/zj_radar_agents.wasm".source =
+  "${inputs.zj-radar.packages.${pkgs.system}.default}/bin/zj_radar_agents.wasm";
 ```
 
-Then point the alias in your generated `config.kdl` at the stable path:
+## 2. Wire it into `config.kdl`
+
+Add a `load_plugins` entry for the aggregator (no pane — it's headless) and
+point zjstatus's `format_right` at `{pipe_agents}`:
 
 ```kdl
+load_plugins {
+    "file:~/.config/zellij/plugins/zj_radar_agents.wasm" {
+        pipe_name "pipe_agents"
+        glyphs "nerd"          // or "plain" without a Nerd Font
+    }
+}
 plugins {
-    radar location="file:~/.config/zellij/plugins/zj_radar.wasm" {
-        naming "managed"
+    zjstatus location="file:~/.config/zellij/plugins/zjstatus-v0.23.0.wasm" {
+        format_right "... {pipe_agents}{pipe_resources} ..."
+        pipe_agents_format     "{output}"
+        pipe_agents_rendermode "dynamic"
     }
 }
 ```
 
-Tagged releases also publish a prebuilt wasm artifact that can be pinned without
-a Rust toolchain (so pinned Nix setups need no Rust toolchain):
+`pipe_name` must match between the `load_plugins` block and the
+`pipe_<name>_format`/`pipe_<name>_rendermode` keys on your zjstatus config —
+zjstatus derives its widget key by stripping the trailing `_format`/
+`_rendermode` from the config key, so `pipe_agents_format` expects a payload
+published under the name `pipe_agents`. See
+[`configuration.md`](configuration.md) for every option.
 
-```nix
-zjRadarWasm = pkgs.fetchurl {
-  url = "https://github.com/marktoda/zj-radar/releases/latest/download/zj_radar.wasm";
-  hash = "sha256-..."; # nix-prefetch-url the asset to fill this in
-};
+The fixed wasm path matters for the next step: Zellij ties a plugin's
+permission grant to its `load_plugins`/`plugins` location string.
+
+## 3. Grant the permission (one time)
+
+A `load_plugins` plugin has no pane, so Zellij's first-run `y`/`n` permission
+prompt has nowhere to render. Launch it once as a floating pane instead:
+
+```sh
+zellij action launch-or-focus-plugin "file:$HOME/.config/zellij/plugins/zj_radar_agents.wasm" --floating
 ```
 
-The old `@smartTabs@` substitution is fully retired — zj-radar owns the rail.
+Press `y` in the floating pane, then close it. The grant is cached per wasm
+path in Zellij's `permissions.kdl`, so **replacing the wasm in place** (an
+upgrade) keeps the grant — only a path change re-prompts. This has to be done
+once per machine, not once per session.
 
-## Files zj-radar creates (and how to fully remove them)
+Zellij only reads `load_plugins` at session start, and the plugin's permission
+set is `ReadApplicationState` + `MessageAndLaunchOtherPlugins` — nothing that
+runs commands or mutates application state.
 
-Everything zj-radar touches, what creates it, and what `setup zellij
---uninstall` does about it. Paths are the defaults; `ZELLIJ_CONFIG_DIR` /
-`XDG_CONFIG_HOME` move the config-dir entries with them.
+## 4. Restart Zellij
 
-| File | Created by | `--uninstall` |
-|---|---|---|
-| `~/.config/zellij/config.kdl` — managed `radar` alias between `// zj-radar:` markers | `setup zellij` | **reversed** — strips only the fenced block |
-| `~/.config/zellij/layouts/<name>.kdl` — rail spliced between markers | `setup zellij --inject` into an existing layout | **reversed** — byte-for-byte inverse of the splice |
-| `~/.config/zellij/layouts/<name>.kdl` — whole file | `setup zellij --inject` when no layout existed | **left in place** (it has no splice to reverse) — delete the file to remove |
-| `<edited file>.zj-radar.bak` — pre-edit backups | every config/layout edit | left in place (they're your restore points) — delete when satisfied |
-| `~/.config/zellij/plugins/zj_radar.wasm` | `setup zellij --wasm/--download` | left in place — `rm` it to remove |
-| `permissions.kdl` grant entry (macOS `~/Library/Caches/org.Zellij-Contributors.Zellij/`, Linux `~/.cache/zellij/`) | `setup zellij` (pre-authorized with your consent at install, merge-safe with a `.zj-radar.bak`), or *Zellij* when you answer y to a prompt | left in place (Zellij also writes this file) — edit out the `zj_radar.wasm` block to revoke |
-| `run`'s owned config dir (macOS `~/Library/Application Support/zj-radar/`, Linux `~/.local/share/zj-radar/`) | `zj-radar run` | not touched by `setup` — `rm -r` the directory; it holds nothing but re-materializable assets and session markers |
-| Per-session plugin state under Zellij's cache + `/tmp/zj-radar` fallback | the running plugin | self-pruning (24 h); safe to delete anytime |
-| `$CODEX_HOME/hooks.json` entries (+ optional `notify` slot in `config.toml`) | `setup codex` | **reversed** by `setup codex --uninstall` |
+`load_plugins` entries are read once, at session launch — a new artifact on
+disk never hot-swaps into a running session. Start a new session (or restart
+Zellij) to pick up the widget. If nothing shows in the bar yet, that's
+expected: an empty `{pipe_agents}` renders as nothing until a producer reports
+something. See [Producers](producers.md).
 
-So a complete removal is: `zj-radar setup zellij --uninstall && zj-radar setup
-codex --uninstall`, then delete the wasm, the `zj-radar` data dir, and the
-grant block — plus the binary itself, wherever you installed it.
+## Verifying it's wired up
+
+`zj-radar setup --check` reports on producers (Claude/Codex), not on the
+aggregator itself — there is nothing for `setup` to check there, since it
+never installed it. To sanity-check the aggregator directly, broadcast a fake
+status from inside the session (see
+[the smoke test in producers.md](producers.md#writing-your-own-producer)) and
+confirm the bar picks it up within about a second.
+
+## Uninstalling
+
+Nothing here is installed *for* you, so nothing needs an uninstaller:
+
+- Remove the `load_plugins` entry and the `pipe_agents*` keys from your
+  `config.kdl` yourself.
+- `rm ~/.config/zellij/plugins/zj_radar_agents.wasm`.
+- To revoke the permission grant, edit the wasm's block out of Zellij's
+  `permissions.kdl` (macOS: `~/Library/Caches/org.Zellij-Contributors.Zellij/`;
+  Linux: `~/.cache/zellij/`, or `$XDG_CACHE_HOME/zellij`).
+
+Producers are still uninstalled through the CLI: `zj-radar setup claude
+--uninstall` / `zj-radar setup codex --uninstall`.

@@ -60,17 +60,23 @@ before the tag**. The order below matters; each step gates the next.
 
    `release.yml` builds the wasm (nix) + portable CLI tarballs, checksums
    everything, and creates the GitHub release — but only after its gates pass:
-   the fast deterministic + bash suites re-run on the tagged commit, and the
-   live E2E suite runs on both OSes (via the reusable `e2e.yml`). A red gate
-   means nothing publishes; fix, delete the tag, re-tag.
+   the fast deterministic + bash suites re-run on the tagged commit
+   (`test`), and the wasm/CLI builds themselves must succeed
+   (`build-wasm`/`build-cli`). There is no live E2E gate — the old sidebar's
+   E2E suite was removed along with it. A red gate means nothing publishes;
+   fix, delete the tag, re-tag.
 
-6. **Verify the release assets.** The `verify-funnel` job in `release.yml`
-   does this automatically after the release is created: it runs the README
-   quickstart verbatim in a pristine container against the tag's published
-   assets (installer, `--download`, pre-seeded grant, live rail, tab naming).
-   **Don't announce until it is green.** `funnel.yml` re-runs the same script
-   nightly against `latest` (and on `workflow_dispatch`). Manual fallback from
-   a clean shell:
+6. **Verify the release assets.** The `verify-installer` job in `release.yml`
+   does this automatically after the release is created: on a pristine
+   container, it installs the published CLI via `install.sh`, checks the
+   reported version matches the tag, and confirms the surviving subcommands
+   at least parse (`zj-radar notify generic --dry-run`, `zj-radar setup
+   --check`). It does **not** cover the aggregator wasm or a live Zellij
+   session — there is no turnkey Zellij path left to test that way; the
+   aggregator is wired into the user's own `config.kdl` (see
+   [`docs/install.md`](docs/install.md)), not installed by anything this repo
+   ships. **Don't announce until it is green.** Manual fallback from a clean
+   shell:
 
    ```sh
    # Sandbox the install so it doesn't overwrite your daily binary:

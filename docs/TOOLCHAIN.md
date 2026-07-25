@@ -11,16 +11,13 @@ builds with exactly that toolchain).
 
 ```sh
 cargo test                                          # host tests
-cargo build --release --target wasm32-wasip1 -p zj-radar-plugin   # the WASM plugin
-# → target/wasm32-wasip1/release/zj_radar.wasm
+cargo build --release --target wasm32-wasip1 -p zj-radar-agents   # the WASM plugin
+# → target/wasm32-wasip1/release/zj_radar_agents.wasm
 ```
 
-To dogfood that release build through the normal install path:
-
-```sh
-cargo install --path crates/cli
-zj-radar setup zellij --wasm target/wasm32-wasip1/release/zj_radar.wasm
-```
+`just build-wasm` is the same wasm build; `just install-wasm` builds it and
+copies the artifact to `${ZELLIJ_CONFIG_DIR:-~/.config/zellij}/plugins/`,
+where the `load_plugins` entry in [`install.md`](install.md) expects it.
 
 ## If your `cargo` lacks the `wasm32-wasip1` target
 
@@ -31,22 +28,20 @@ target to that toolchain, or use the repo's Nix dev shell, which pins a Rust wit
 the target:
 
 ```sh
-nix develop -c cargo build --release --target wasm32-wasip1 -p zj-radar-plugin
+nix develop -c cargo build --release --target wasm32-wasip1 -p zj-radar-agents
 ```
 
 ## Dev loop
 
 ```sh
-just dev          # build wasm + CLI, launch a FRESH sandboxed zj-radar-dev-<hhmmss> session
+just install-wasm   # build-wasm + copy the artifact into place
 ```
 
-Uses the ambient Rust toolchain (`rust-toolchain.toml` auto-installs the
-wasm target on first build). In the Nix shell, prefix with `nix develop -c`.
+Uses the ambient Rust toolchain (`rust-toolchain.toml` auto-installs the wasm
+target on first build). In the Nix shell, prefix with `nix develop -c`.
 
-Zellij 0.44 does not safely hot-reload plugins that were created by a layout:
-`start-or-reload-plugin` opens a second pane instead. The dev loop therefore
-never reloads in place — every iteration is a fresh, uniquely named
-`zj-radar-dev-<hhmmss>` session (exited leftovers are swept; live sessions are
-never killed), launched from a plain terminal (`zj-radar run` refuses to nest inside
-Zellij) and fully sandboxed under `target/dev/data`, so it runs alongside your
-real sessions without touching them or an installed zj-radar's assets.
+Zellij only reads a `load_plugins` entry at session launch, and does not
+hot-reload it — start a new session to pick up a freshly installed wasm. The
+permission grant is cached per wasm path, so replacing the file in place
+(what `just install-wasm` does) keeps it; see
+[Grant the permission](install.md#3-grant-the-permission-one-time).

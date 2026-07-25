@@ -1,9 +1,14 @@
 # Distribution: making the agent notifiers easy to install
 
-> **Status: shipped — historical.** The conclusions here landed as the turnkey
-> `zj-radar run` command and the zero-config Claude Code producer plugin (no
-> `settings.json` editing). Kept for the rationale behind those choices; for how
-> to *use* the result, see [`install.md`](install.md) and the README, not this memo.
+> **Status: shipped — historical.** The conclusions here landed as the
+> zero-config Claude Code producer plugin (no `settings.json` editing) and the
+> `zj-radar setup [claude|codex]` CLI. Kept for the rationale behind those
+> choices; for how to *use* the result, see [`install.md`](install.md) and the
+> README, not this memo. **§4 below describes the original turnkey Zellij
+> install layer (`zj-radar setup zellij`), which was later replaced by a
+> headless zjstatus aggregator the user wires into their own `config.kdl` —
+> see [`install.md`](install.md) for the current story; §4 is kept only as the
+> historical record of what came before it.**
 
 **Problem:** today wiring up the notifiers means hand-editing several files
 (`~/.claude/settings.json`, `~/.codex/hooks.json`, shell scripts, Nix). That's
@@ -31,8 +36,9 @@ There are **two install surfaces**, and they have *different* best answers:
    installer pattern against their native config/plugin surfaces.
 
 Plus a third, separate surface: **the Zellij plugin itself** (the wasm + its
-permission grant + the layout). That's now handled by `zj-radar setup zellij`
-plus an explicit layout snippet (see §4).
+permission grant). At the time this memo was written that was handled by
+`zj-radar setup zellij` plus an explicit layout snippet (see §4) — that
+turnkey layer was later removed; see the status note above.
 
 ---
 
@@ -130,7 +136,14 @@ subcommands `notify`, `setup`, `setup --check`, and `setup --uninstall`. Native 
 no `jq`/`bash` runtime deps, cross-platform, easy to vendor. It ships alongside
 the wasm plugin.
 
-## 4. The Zellij-plugin side of install (separate but needed)
+## 4. The Zellij-plugin side of install (separate but needed) — historical
+
+**This section describes the original turnkey design and no longer matches
+the shipped install path.** The per-tab sidebar plugin this section was
+written for was later removed in favor of a single headless aggregator
+plugin that feeds a `{pipe_agents}` widget into the user's own zjstatus bar;
+see [`install.md`](install.md) for how installation actually works today. Kept
+below only as the historical record of the reasoning at the time.
 
 Installing the *sidebar* itself needs three things:
 
@@ -151,7 +164,12 @@ selectable only while the prompt is pending; because the sidebar is instantiated
 once per tab, per-tab prompt coordination elects one instance to request the
 uncached grant and peers reuse Zellij's cached answer.
 
-## 5. Recommended rollout
+## 5. Recommended rollout — historical
+
+This phasing (and the closing snippet below) reflects the plan at the time
+this memo was written, including the `setup zellij --wasm` step that no
+longer exists — see the status note at the top of this file for what
+replaced it.
 
 1. **Phase 1 (biggest bang, least work):** package the Claude hooks as a **Claude
    Code plugin** (§1). Most users are on Claude Code; this delivers the
@@ -163,7 +181,7 @@ uncached grant and peers reuse Zellij's cached answer.
    patcher. The current setup command should keep printing the snippet rather
    than silently rewriting layouts.
 
-Net new-user story we're aiming for:
+Net new-user story as originally envisioned:
 ```
 # Claude users:
 /plugin install zj-radar-claude@zj-radar
