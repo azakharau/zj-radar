@@ -185,6 +185,11 @@ const BG: &str = "#222436";
 const TAB_ACTIVE_BG: &str = "#7AA2F7";
 const TAB_NAME: &str = "#A9B1D6";
 const TAB_DIM: &str = "#565F89";
+/// Powerline thin separator (U+E0B1). A full-height `│` in the page background
+/// colour reads as a HOLE punched through the block; this chevron is what
+/// powerline-style bars use to divide segments *within* one block, and the user's
+/// font already renders nerd glyphs (see `U+E795` in their `format_right`).
+const DIVIDER: char = '\u{e0b1}';
 const INK: &str = "#222436";
 
 /// Live agent observations, keyed by Zellij terminal pane id.
@@ -416,12 +421,16 @@ impl Agents {
                 // The block itself says "you are here", so the accent colour is
                 // free to carry the status instead of being spent on selection.
                 let accent = agent.map_or(TAB_ACTIVE_BG, |(_, s, _)| role_hex(s.role()));
-                out.push_str(&format!("#[fg={INK},bg={accent},bold] {index} "));
+                // No index on the active tab: it is a jump target, and you cannot
+                // jump to where you already are.
+                out.push_str(&format!("#[fg={INK},bg={accent},bold] "));
                 if let Some((kind, status, count)) = agent {
                     out.push(kind.mark(glyphs));
                     out.push(' ');
                     out.push_str(&status_glyph(status, glyphs, frame));
                     push_count(&mut out, count);
+                    out.push(' ');
+                    out.push(DIVIDER);
                     out.push(' ');
                 }
                 out.push_str(&name);
@@ -442,7 +451,7 @@ impl Agents {
                     out.push(' ');
                     out.push_str(&status_glyph(status, glyphs, frame));
                     push_count(&mut out, count);
-                    out.push(' ');
+                    out.push_str(&format!("#[fg={TAB_DIM}] {DIVIDER} "));
                 }
                 out.push_str(&format!("#[fg={name_colour}]{name}"));
                 out.push_str(&indicators(tab, TAB_DIM));
@@ -915,6 +924,34 @@ mod tests {
         t.flashing_bell = true;
         let flashing = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
         assert!(flashing.contains("#F7768E"), "flash in error: {flashing:?}");
+    }
+
+    #[test]
+    fn the_active_tab_shows_no_index_but_inactive_ones_do() {
+        // The index is a jump target for `GoToTab <n>`; you cannot jump to the tab
+        // you are already on, so showing it there is pure noise.
+        let tabs = [tab(0, "here", true), tab(1, "there", false)];
+        let out = Agents::default().render_tabs(&tabs, &HashMap::new(), nerd(), 0);
+        assert!(!out.contains(" 1 "), "active tab must not show its index: {out:?}");
+        assert!(out.contains(" 2 "), "inactive tab keeps its index: {out:?}");
+    }
+
+    #[test]
+    fn a_divider_separates_the_agent_cluster_from_the_name() {
+        let mut agents = Agents::default();
+        agents.apply(&payload(1, "claude", Status::Running), 0);
+        let map = in_tab(&[(1, 0)]);
+        for active in [true, false] {
+            let out = agents.render_tabs(&[tab(0, "name", active)], &map, nerd(), 0);
+            let d = out.find(DIVIDER).expect("divider present");
+            assert!(
+                d < out.find("name").unwrap(),
+                "divider must sit between glyphs and name (active={active}): {out:?}"
+            );
+        }
+        // A tab with no agent has nothing to divide.
+        let plain = Agents::default().render_tabs(&[tab(0, "name", false)], &map, nerd(), 0);
+        assert!(!plain.contains(DIVIDER), "no divider without an agent: {plain:?}");
     }
 
     #[test]
