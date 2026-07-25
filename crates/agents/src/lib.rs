@@ -35,14 +35,14 @@ pub const DEFAULT_DONE_TTL_TICKS: u64 = 30;
 
 /// Frame interval for the working spinner, in milliseconds.
 ///
-/// 100ms x 12 frames is a 1.2s cycle — close to the tempo of `cli-spinners`'
-/// braille spinners (800ms), which ora/Ink and the agent harnesses animate, so the
-/// bar reads as the same kind of motion as the harness's own.
+/// 80ms x 10 frames is the exact 800ms cycle of `cli-spinners`' `dots`, which is
+/// what ora/Ink and the agent harnesses animate — so the bar spins in step with
+/// the harness's own spinner rather than near it.
 ///
 /// It is not free: every frame is an IPC broadcast plus a full zjstatus repaint,
 /// because zjstatus exempts pipe widgets from its widget cache. Raise
 /// `animate_ms` to spend less, or set `animate false` for a static glyph.
-pub const DEFAULT_ANIMATE_MS: u64 = 100;
+pub const DEFAULT_ANIMATE_MS: u64 = 80;
 
 /// Clamp: below this the bar is pure overhead, above it the animation stutters.
 const MIN_ANIMATE_MS: u64 = 50;
@@ -439,22 +439,20 @@ impl Agents {
     }
 }
 
-/// Working spinner: a HOLLOW 4x4 braille square whose perimeter has one gap
-/// chasing clockwise. Static form `⣏⣹`.
+/// Working spinner: `cli-spinners`' `dots` set — a 3x2 dot ring inside ONE
+/// braille cell, rotating.
 ///
-/// Two braille cells are exactly a 4x4 dot grid, so a 4x4 ring fills the cell's
-/// full height and sits on the text baseline. A 3x3 ring was tried first and
-/// leaves the bottom dot-row dark, which makes the glyph float high in the line —
-/// the same reason core's `working_spin` reads badly here: it lights only a
-/// FOUR-dot snake, so most frames look like specks near one edge. Fine in the old
-/// sidebar's wide rail; dirt on the screen in a one-line bar.
+/// This is the spinner ora/Ink render, so the agent harnesses themselves show
+/// exactly this animation; matching it is the point. Row 3 of the cell is always
+/// empty, which is what makes it read as a compact 3x2 ring rather than a
+/// full-height block.
 ///
-/// Eleven of the twelve perimeter dots are lit at every frame, so it reads as a
-/// solid ring with a gap travelling round it rather than as scattered dots. Two
-/// cells wide, which also balances the one-cell vendor mark beside it.
-const SPINNER: [&str; 12] = [
-    "⣎⣹", "⣇⣹", "⣏⣸", "⣏⣱", "⣏⣩", "⣏⣙", "⣏⡹", "⣏⢹", "⡏⣹", "⢏⣹", "⣋⣹", "⣍⣹",
-];
+/// Earlier attempts were worse for a reason worth recording: core's
+/// `working_spin` and a hand-built hollow square both spanned TWO cells, so the
+/// motion was spread across eight dot-columns and read as scattered specks next
+/// to a solid vendor glyph. Keeping every frame inside one cell keeps it legible
+/// as a single spinning thing — and halves the width.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The status glyph, animated for `Running` only. Every other state is a settled
 /// fact and a moving glyph would imply otherwise.
@@ -1035,17 +1033,21 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_is_a_hollow_square_that_never_goes_sparse() {
-        // Every frame must keep the ring readable: 11 of 12 perimeter dots lit.
-        // A frame that dropped to a few dots is the bug this replaced.
+    fn the_spinner_is_a_single_cell_3x2_ring() {
         for f in &SPINNER {
-            let dots: u32 = f
-                .chars()
-                .map(|c| (c as u32 - 0x2800).count_ones())
-                .sum();
-            assert_eq!(dots, 11, "frame {f:?} should light 11 dots");
+            let chars: Vec<char> = f.chars().collect();
+            assert_eq!(chars.len(), 1, "frame {f:?} must be ONE cell wide");
+            let bits = chars[0] as u32 - 0x2800;
+            // Row 3 (dots 7/8, bits 0x40/0x80) must stay dark: that is what makes
+            // it a compact 3x2 ring instead of a full-height glyph.
+            assert_eq!(bits & 0xC0, 0, "frame {f:?} must not use the bottom row");
+            assert!((3..=4).contains(&bits.count_ones()), "frame {f:?} dot count");
         }
-        assert_eq!(SPINNER.len(), 12, "one frame per perimeter dot");
+        assert_eq!(SPINNER.len(), 10, "the cli-spinners `dots` cycle");
+        // Consecutive frames must differ or it would not read as motion.
+        for w in SPINNER.windows(2) {
+            assert_ne!(w[0], w[1]);
+        }
     }
 
     #[test]
