@@ -32,12 +32,28 @@ pub const DEFAULT_TTL_TICKS: u64 = 900;
 /// reused. Short enough to read, long enough to notice.
 pub const DEFAULT_DONE_TTL_TICKS: u64 = 30;
 
+/// Frame interval for the working spinner, in milliseconds.
+///
+/// 100ms x 12 frames is a 1.2s cycle — close to the tempo of `cli-spinners`'
+/// braille spinners (800ms), which ora/Ink and the agent harnesses animate, so the
+/// bar reads as the same kind of motion as the harness's own.
+///
+/// It is not free: every frame is an IPC broadcast plus a full zjstatus repaint,
+/// because zjstatus exempts pipe widgets from its widget cache. Raise
+/// `animate_ms` to spend less, or set `animate false` for a static glyph.
+pub const DEFAULT_ANIMATE_MS: u64 = 100;
+
+/// Clamp: below this the bar is pure overhead, above it the animation stutters.
+const MIN_ANIMATE_MS: u64 = 50;
+const MAX_ANIMATE_MS: u64 = 1000;
+
 /// Runtime configuration, read from the `load_plugins` node in `config.kdl`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pipe_name: String,
     glyphs: GlyphSet,
     animate: bool,
+    animate_ms: u64,
     ttl_ticks: u64,
     done_ttl_ticks: u64,
 }
@@ -48,6 +64,7 @@ impl Default for Config {
             pipe_name: DEFAULT_PIPE_NAME.to_string(),
             glyphs: GlyphSet::default(),
             animate: true,
+            animate_ms: DEFAULT_ANIMATE_MS,
             ttl_ticks: DEFAULT_TTL_TICKS,
             done_ttl_ticks: DEFAULT_DONE_TTL_TICKS,
         }
@@ -75,6 +92,9 @@ impl Config {
             animate: non_empty(configuration, "animate")
                 .map(|v| !matches!(v.as_str(), "false" | "0" | "no" | "off"))
                 .unwrap_or(defaults.animate),
+            animate_ms: parse_ticks(configuration, "animate_ms")
+                .map(|ms| ms.clamp(MIN_ANIMATE_MS, MAX_ANIMATE_MS))
+                .unwrap_or(defaults.animate_ms),
             ttl_ticks: parse_ticks(configuration, "ttl_secs").unwrap_or(defaults.ttl_ticks),
             done_ttl_ticks: parse_ticks(configuration, "done_ttl_secs")
                 .unwrap_or(defaults.done_ttl_ticks),
@@ -87,6 +107,11 @@ impl Config {
 
     pub fn animate(&self) -> bool {
         self.animate
+    }
+
+    /// Frame interval in seconds, for `set_timeout`.
+    pub fn animate_secs(&self) -> f64 {
+        self.animate_ms as f64 / 1000.0
     }
 
     /// The exact line zjstatus expects: it splits on `::`, requires the
@@ -144,6 +169,14 @@ pub struct TabView {
     /// bell. Only visible if the bar repaints fast enough, which the animation
     /// cadence already guarantees.
     pub flashing_bell: bool,
+    /// `TabInfo::is_sync_panes_active` — input is broadcast to every pane here.
+    /// Dangerous to forget, so it stays visible; zjstatus rendered it as
+    /// `[sync]` and dropping it when the plugin took over the strip would be a
+    /// regression.
+    pub sync: bool,
+    /// `TabInfo::is_fullscreen_active` — a pane is zoomed, so the tab is hiding
+    /// its siblings.
+    pub fullscreen: bool,
 }
 
 /// Tokyo Night palette, matching the hand-written zjstatus config this replaces
@@ -342,13 +375,25 @@ impl Agents {
     /// zjstatus's per-tab tokens are a closed set (`{index}`, `{name}`, sync /
     /// fullscreen / floating) with no way to inject agent state. So the only way
     /// to show status *per tab* — short of renaming the user's tabs, which needs
-    /// `ChangeApplicationState` and mutates state we do not own — is to draw the
-    /// strip here and hand it over as one pipe value.
+    /// `ChangeApplicationState` and overwrites names the user owns — is to draw
+    /// the strip here and hand it over as one pipe value.
     ///
-    /// A tab holding an agent reads `<vendor><status> │ <name>`, the status glyph
-    /// animating while it works. The ACTIVE tab takes the status colour as its
-    /// background, so "where am I" and "what is it doing" cost no extra width.
-    /// Tabs with no agent keep zjstatus's stock look.
+    /// Layout, and why each part earns its cells:
+    ///
+    /// ```text
+    ///   1 recall      2 π⣻ build      3 notes󰂚 [sync]
+    ///   │ │           │ │  │          │       │
+    ///   │ │           │ │  └ name     │       └ zellij's own indicators
+    ///   │ │           │ └ vendor+status, animated only while working
+    ///   │ └ name      └ index is ALWAYS shown: navigation is `GoToTab <n>`,
+    ///   └ index         so hiding it on the tab you are on is hostile
+    /// ```
+    ///
+    /// The colour hierarchy is the point: a tab that *needs you* (pending/error)
+    /// puts the status colour on the NAME as well, so it reads as urgent from the
+    /// corner of your eye. A tab that is merely working keeps a normal name and
+    /// says so only through the small animated glyph — busy is not urgent, and
+    /// making it shout would train you to ignore the strip.
     pub fn render_tabs(
         &self,
         tabs: &[TabView],
@@ -358,66 +403,96 @@ impl Agents {
     ) -> String {
         let mut out = String::new();
         for tab in tabs {
-            let bell = bell_glyph(tab);
             // Tab names are user-controlled and reach us verbatim from Zellij. A
             // newline would be read as a zjstatus directive separator (this
             // string is published alongside a second directive), and an escape
-            // sequence could repaint the bar arbitrarily. Core's sanitizer
-            // already strips control chars, bidi overrides and ANSI/OSC, and
-            // caps the width.
+            // sequence could repaint the bar arbitrarily. Core's sanitizer strips
+            // control chars, bidi overrides and ANSI/OSC, and caps the width.
             let name = sanitize(&tab.name, MAX_TAB_NAME_CHARS);
-            match (tab.active, self.tab_status(tab.position, pane_tab)) {
-                (true, Some((kind, status, count))) => {
-                    let role = role_hex(status.role());
-                    out.push_str(&format!("#[fg={INK},bg={role},bold] "));
+            let agent = self.tab_status(tab.position, pane_tab);
+            let index = tab.position + 1;
+
+            if tab.active {
+                // The block itself says "you are here", so the accent colour is
+                // free to carry the status instead of being spent on selection.
+                let accent = agent.map_or(TAB_ACTIVE_BG, |(_, s, _)| role_hex(s.role()));
+                out.push_str(&format!("#[fg={INK},bg={accent},bold] {index} "));
+                if let Some((kind, status, count)) = agent {
                     out.push(kind.mark(glyphs));
+                    out.push(' ');
                     out.push_str(&status_glyph(status, glyphs, frame));
-                    out.push_str(" │ ");
-                    out.push_str(&name);
                     push_count(&mut out, count);
-                    out.push_str(&bell);
-                    out.push_str(&format!(" #[fg={role},bg={BG}]"));
-                }
-                (true, None) => {
-                    out.push_str(&format!("#[fg={INK},bg={TAB_ACTIVE_BG},bold] "));
-                    out.push_str(&name);
-                    out.push_str(&bell);
-                    out.push_str(&format!(" #[fg={TAB_ACTIVE_BG},bg={BG}]"));
-                }
-                (false, Some((kind, status, count))) => {
-                    let role = role_hex(status.role());
-                    out.push_str(&format!("#[fg={role},bg={BG}] "));
-                    out.push(kind.mark(glyphs));
-                    out.push_str(&status_glyph(status, glyphs, frame));
-                    out.push_str(&format!("#[fg={TAB_DIM}] │ #[fg={TAB_NAME}]"));
-                    out.push_str(&name);
-                    push_count(&mut out, count);
-                    out.push_str(&bell);
                     out.push(' ');
                 }
-                (false, None) => {
-                    out.push_str(&format!(
-                        "#[fg={TAB_DIM},bg={BG}] {}:#[fg={TAB_NAME}]{}",
-                        tab.position + 1,
-                        name
-                    ));
-                    out.push_str(&bell);
+                out.push_str(&name);
+                out.push_str(&indicators(tab, INK));
+                out.push_str(&bell_glyph(tab));
+                out.push_str(&format!(" #[fg={accent},bg={BG}] "));
+            } else {
+                out.push_str(&format!("#[fg={TAB_DIM},bg={BG}] {index} "));
+                let name_colour = match agent {
+                    // Needs you: paint the name too, so it is findable without
+                    // reading glyphs.
+                    Some((_, s, _)) if s.needs_you() => role_hex(s.role()),
+                    _ => TAB_NAME,
+                };
+                if let Some((kind, status, count)) = agent {
+                    out.push_str(&format!("#[fg={}]", role_hex(status.role())));
+                    out.push(kind.mark(glyphs));
+                    out.push(' ');
+                    out.push_str(&status_glyph(status, glyphs, frame));
+                    push_count(&mut out, count);
                     out.push(' ');
                 }
+                out.push_str(&format!("#[fg={name_colour}]{name}"));
+                out.push_str(&indicators(tab, TAB_DIM));
+                out.push_str(&bell_glyph(tab));
+                out.push(' ');
             }
         }
         out
     }
 }
 
+/// Working spinner: a HOLLOW 4x4 braille square whose perimeter has one gap
+/// chasing clockwise. Static form `⣏⣹`.
+///
+/// Two braille cells are exactly a 4x4 dot grid, so a 4x4 ring fills the cell's
+/// full height and sits on the text baseline. A 3x3 ring was tried first and
+/// leaves the bottom dot-row dark, which makes the glyph float high in the line —
+/// the same reason core's `working_spin` reads badly here: it lights only a
+/// FOUR-dot snake, so most frames look like specks near one edge. Fine in the old
+/// sidebar's wide rail; dirt on the screen in a one-line bar.
+///
+/// Eleven of the twelve perimeter dots are lit at every frame, so it reads as a
+/// solid ring with a gap travelling round it rather than as scattered dots. Two
+/// cells wide, which also balances the one-cell vendor mark beside it.
+const SPINNER: [&str; 12] = [
+    "⣎⣹", "⣇⣹", "⣏⣸", "⣏⣱", "⣏⣩", "⣏⣙", "⣏⡹", "⣏⢹", "⡏⣹", "⢏⣹", "⣋⣹", "⣍⣹",
+];
+
 /// The status glyph, animated for `Running` only. Every other state is a settled
 /// fact and a moving glyph would imply otherwise.
 fn status_glyph(status: Status, glyphs: GlyphSet, frame: usize) -> String {
     if status == Status::Running {
-        zj_radar_core::status::working_spin(frame).to_string()
+        SPINNER[frame % SPINNER.len()].to_string()
     } else {
         status.glyph_for(glyphs).to_string()
     }
+}
+
+/// Zellij's own per-tab flags, kept because the plugin took over the strip and
+/// silently dropping them would be a regression. Rendered in the caller's dim
+/// colour so they never compete with agent status.
+fn indicators(tab: &TabView, colour: &str) -> String {
+    let mut out = String::new();
+    if tab.sync {
+        out.push_str(&format!("#[fg={colour}] [sync]"));
+    }
+    if tab.fullscreen {
+        out.push_str(&format!("#[fg={colour}] [full]"));
+    }
+    out
 }
 
 /// A bell marker for the tab. Flashing (the transient 400ms state) is louder
@@ -731,6 +806,8 @@ mod tests {
             active,
             bell: false,
             flashing_bell: false,
+            sync: false,
+            fullscreen: false,
         }
     }
 
@@ -742,8 +819,10 @@ mod tests {
     fn a_tab_without_an_agent_keeps_the_stock_look() {
         let out = Agents::default().render_tabs(&[tab(0, "notes", false)], &HashMap::new(), nerd(), 0);
         assert!(out.contains("notes"), "{out:?}");
-        assert!(out.contains("1:"), "index shown for plain tabs: {out:?}");
-        assert!(!out.contains('│'), "no agent separator on a plain tab: {out:?}");
+        assert!(out.contains(" 1 "), "index is always shown \u{2014} navigation is GoToTab <n>: {out:?}");
+        for kind in Kind::ALL {
+            assert!(!out.contains(kind.mark(nerd())), "no vendor glyph on a plain tab: {out:?}");
+        }
     }
 
     #[test]
@@ -753,8 +832,14 @@ mod tests {
         let out = agents.render_tabs(&[tab(0, "build", false)], &in_tab(&[(4, 0)]), nerd(), 0);
         assert!(out.contains(Kind::Codex.mark(nerd())), "vendor icon: {out:?}");
         assert!(out.contains(Status::Pending.glyph_for(nerd())), "status: {out:?}");
-        assert!(out.contains('│'), "separator: {out:?}");
+        assert!(out.contains(" 1 "), "index still shown alongside the agent: {out:?}");
         assert!(out.contains("build"), "tab name: {out:?}");
+        // Pending "needs you", so the NAME takes the status colour too, making the
+        // tab findable without reading glyphs.
+        assert!(
+            out.contains(&format!("#[fg={}]build", role_hex(Status::Pending.role()))),
+            "an attention state must colour the name: {out:?}"
+        );
     }
 
     #[test]
@@ -807,7 +892,7 @@ mod tests {
         // The decoration must sit in tab 1's segment, i.e. after tab 0's name.
         let after_left = out.find("left").unwrap();
         assert!(out.find(mark).unwrap() > after_left, "leaked into tab 0: {out:?}");
-        assert!(out.contains("1:"), "tab 0 keeps its plain index: {out:?}");
+        assert!(out.contains(" 1 "), "tab 0 keeps its plain index: {out:?}");
     }
 
     #[test]
@@ -830,6 +915,51 @@ mod tests {
         t.flashing_bell = true;
         let flashing = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
         assert!(flashing.contains("#F7768E"), "flash in error: {flashing:?}");
+    }
+
+    #[test]
+    fn zellijs_own_indicators_survive_the_takeover() {
+        // The plugin owns the strip now, so if it does not draw these they vanish
+        // silently — and forgetting that input is broadcast to every pane is
+        // exactly the kind of surprise a status bar exists to prevent.
+        let mut t = tab(0, "t", false);
+        t.sync = true;
+        let out = Agents::default().render_tabs(&[t.clone()], &HashMap::new(), nerd(), 0);
+        assert!(out.contains("[sync]"), "{out:?}");
+        assert!(!out.contains("[full]"), "{out:?}");
+
+        t.fullscreen = true;
+        let both = Agents::default().render_tabs(&[t], &HashMap::new(), nerd(), 0);
+        assert!(both.contains("[sync]") && both.contains("[full]"), "{both:?}");
+    }
+
+    #[test]
+    fn a_working_tab_keeps_a_calm_name_while_an_urgent_one_does_not() {
+        // Busy is not urgent. If "running" shouted as loudly as "needs you" the
+        // strip would train you to ignore it.
+        let mut running = Agents::default();
+        running.apply(&payload(1, "claude", Status::Running), 0);
+        let calm = running.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0)]), nerd(), 0);
+        assert!(calm.contains(&format!("#[fg={TAB_NAME}]t")), "{calm:?}");
+
+        let mut urgent = Agents::default();
+        urgent.apply(&payload(1, "claude", Status::Error), 0);
+        let loud = urgent.render_tabs(&[tab(0, "t", false)], &in_tab(&[(1, 0)]), nerd(), 0);
+        assert!(loud.contains(&format!("#[fg={}]t", role_hex(Role::Error))), "{loud:?}");
+    }
+
+    #[test]
+    fn the_spinner_is_a_hollow_square_that_never_goes_sparse() {
+        // Every frame must keep the ring readable: 11 of 12 perimeter dots lit.
+        // A frame that dropped to a few dots is the bug this replaced.
+        for f in &SPINNER {
+            let dots: u32 = f
+                .chars()
+                .map(|c| (c as u32 - 0x2800).count_ones())
+                .sum();
+            assert_eq!(dots, 11, "frame {f:?} should light 11 dots");
+        }
+        assert_eq!(SPINNER.len(), 12, "one frame per perimeter dot");
     }
 
     #[test]

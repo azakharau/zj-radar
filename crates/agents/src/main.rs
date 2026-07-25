@@ -13,16 +13,6 @@ mod plugin {
     use zj_radar_agents::{Agents, Config, TabView};
     use zj_radar_core::{parse, STATUS_PIPE_NAME};
 
-    /// Frame clock while something is working: the spinner needs this to move,
-    /// and the 400ms bell flash needs it to be visible at all.
-    ///
-    /// Deliberately 5 Hz, not the old sidebar's 8 Hz. That sidebar animated
-    /// in-process; here every frame is an IPC broadcast plus a full zjstatus
-    /// repaint (its pipe widgets bypass the widget cache), which measured
-    /// 14-20% server CPU at 8 Hz versus ~6% here — for an animation the eye
-    /// cannot tell apart.
-    const FAST_SECS: f64 = 0.2;
-
     /// Frame clock when nothing is animating. Still sub-second, because it also
     /// carries the publish that `pipe` deliberately defers — an agent hook must
     /// reach the bar in well under a second — but slow enough that an idle
@@ -161,7 +151,11 @@ mod plugin {
                         // widget 5 times a second for nothing.
                         self.publish(!state_changed);
                     }
-                    set_timeout(if animating { FAST_SECS } else { IDLE_SECS });
+                    set_timeout(if animating {
+                        self.config.animate_secs()
+                    } else {
+                        IDLE_SECS
+                    });
                 }
                 Event::TabUpdate(tabs) => self.tabs_changed(tabs),
                 Event::PaneUpdate(manifest) => self.panes_changed(manifest),
@@ -224,6 +218,8 @@ mod plugin {
                     active: t.active,
                     bell: t.has_bell_notification,
                     flashing_bell: t.is_flashing_bell,
+                    sync: t.is_sync_panes_active,
+                    fullscreen: t.is_fullscreen_active,
                 })
                 .collect();
             if next != self.tabs {
