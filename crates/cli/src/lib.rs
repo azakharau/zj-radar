@@ -17,13 +17,10 @@
 pub(crate) use zj_radar_core::{command, kind, payload, pipe, status};
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 mod agents;
 mod fsutil;
-pub(crate) mod layout;
 mod notify;
-mod run;
 mod setup;
 
 /// Process-wide failure flag. The setup/run orchestrators report refusals and
@@ -92,25 +89,10 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Launch a turnkey Zellij session with the radar rail (owns its own config).
-    Run {
-        /// Session name (default: current directory's name).
-        name: Option<String>,
-        /// Print the zellij command instead of launching it.
-        #[arg(long)]
-        print_cmd: bool,
-    },
-    /// Idempotently wire installed agents and Zellij to use zj-radar.
+    /// Idempotently wire installed agents to use zj-radar.
     Setup {
-        /// Targets to set up (default: detected agents only). Supported: claude, codex, zellij.
+        /// Targets to set up (default: detected agents only). Supported: claude, codex.
         targets: Vec<String>,
-        /// Wasm artifact to install when setting up Zellij.
-        #[arg(long, value_name = "PATH")]
-        wasm: Option<PathBuf>,
-        /// Download the wasm matching this CLI's version instead of passing --wasm
-        /// (set ZJ_RADAR_VERSION to pin a different release tag).
-        #[arg(long)]
-        download: bool,
         /// Remove our entries instead of adding them.
         #[arg(long)]
         uninstall: bool,
@@ -131,20 +113,6 @@ enum Command {
         /// Overwrite conflicting entries where supported.
         #[arg(long)]
         force: bool,
-        /// Inject the rail into the target layout without prompting (consent flag).
-        #[arg(long)]
-        inject: bool,
-        /// Target layout name (default: the config's `default_layout`, else
-        /// "default"). Looks up `<config_dir>/layouts/<name>.kdl`; honored by
-        /// install, --uninstall, and --check alike.
-        #[arg(long, value_name = "NAME")]
-        layout: Option<String>,
-        /// Open the plugin in a focused floating pane so Zellij can prompt for
-        /// permissions (one-time grant). Exits after launching; does not run the
-        /// wasm/alias/inject steps. Conflicts with `dry_run`/`check` too: the
-        /// grant launches a real pane, which a "write nothing" flag must not.
-        #[arg(long, conflicts_with_all = ["wasm", "download", "inject", "layout", "uninstall", "dry_run", "check"])]
-        grant: bool,
     },
 }
 
@@ -153,9 +121,6 @@ enum Command {
 pub fn run() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { name, print_cmd } => {
-            run::run(run::RunOptions { name, print_cmd });
-        }
         Command::Notify {
             agent,
             input,
@@ -179,31 +144,21 @@ pub fn run() -> std::process::ExitCode {
         }
         Command::Setup {
             targets,
-            wasm,
-            download,
             uninstall,
             dry_run,
             yes,
             check,
             legacy_notify,
             force,
-            inject,
-            layout,
-            grant,
         } => {
             setup::run(setup::SetupOptions {
                 targets: &targets,
-                wasm: wasm.as_deref(),
-                download,
                 uninstall,
                 dry_run,
                 yes,
                 check,
                 legacy_notify,
                 force,
-                inject,
-                layout: layout.as_deref(),
-                grant,
             });
         }
     }

@@ -256,6 +256,7 @@ fn broadcast(pane_id: u32, update: AgentUpdate, source: &str, dry_run: bool) {
         task,
         source: source.to_string(),
         ack: false,
+        gone: false,
     });
 
     if dry_run {

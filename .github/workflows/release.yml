@@ -12,10 +12,8 @@ jobs:
   # ── Gates: nothing publishes from a red tree ─────────────────────────────────
   # Tags are cut by a human (RELEASING.md); nothing structurally guarantees the
   # tagged commit ever saw CI, so the release re-earns it here. `test` re-runs
-  # the fast deterministic + bash suites on THIS commit; `e2e` runs the live
-  # L5 suite on both OSes (the reusable E2E workflow — before this, e2e.yml's
-  # own `tags` trigger raced the publish instead of gating it). The build jobs
-  # start in parallel — only the publish step below waits on the gates.
+  # the fast deterministic + bash suites on THIS commit. The build jobs start in
+  # parallel — only the publish step below waits on the gates.
   test:
     runs-on: ubuntu-latest
     env:
@@ -32,22 +30,15 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
       - uses: Swatinem/rust-cache@v2
-      - name: deterministic suite (L1-L4)
+      - name: deterministic suite
         run: nix develop -c cargo test --workspace --all-features
       - name: bash hook + installer tests
         run: nix develop -c just test-bash
 
-  e2e:
-    uses: ./.github/workflows/e2e.yml
-    permissions:
-      contents: read
-      issues: write
-
   # ── The wasm, built once on nix ────────────────────────────────────────────
   # nix cleanly handles zellij-tile's openssl-sys build dep (plain cargo would
-  # need apt libssl-dev/pkg-config), and every CLI build embeds THIS artifact
-  # (build.rs picks it up via ZJ_RADAR_WASM_PATH), so the CLI runners need no
-  # wasm target and no inline wasm compile.
+  # need apt libssl-dev/pkg-config). The CLI no longer embeds it — the plugin is
+  # a standalone release asset the user points `load_plugins` at.
   build-wasm:
     runs-on: ubuntu-latest
     steps:
@@ -63,11 +54,11 @@ jobs:
       - name: Build wasm
         run: nix build .#zj-radar -L
       - name: Stage wasm
-        run: cp result/bin/zj_radar.wasm zj_radar.wasm
+        run: cp result/bin/zj_radar_agents.wasm zj_radar_agents.wasm
       - uses: actions/upload-artifact@v4
         with:
           name: wasm
-          path: zj_radar.wasm
+          path: zj_radar_agents.wasm
 
   # ── Portable CLI binaries (plain cargo, NOT nix) ───────────────────────────
   # The CLI ships to non-nix machines via the curl|sh installer, so the binaries
@@ -75,7 +66,7 @@ jobs:
   # path and fails to exec anywhere else, so Linux builds use the fully-static
   # `*-musl` target. macOS links only the always-present libSystem. Asset names
   # are the Rust target triple so `cargo binstall` and the installer share one
-  # mapping. The wasm built above is embedded via ZJ_RADAR_WASM_PATH.
+  # mapping. The CLI carries no wasm payload.
   #
   # No x86_64 macOS: the audience is overwhelmingly Apple Silicon, and `macos-13`
   # (Intel) is GitHub's scarcest runner — it queues for minutes and blocks every
@@ -115,7 +106,6 @@ jobs:
 
       - name: Build CLI
         env:
-          ZJ_RADAR_WASM_PATH: ${{ github.workspace }}/zj_radar.wasm
         run: cargo build --release --locked --bin zj-radar --target ${{ matrix.target }}
 
       - name: Stage CLI artifact
@@ -127,7 +117,7 @@ jobs:
           path: zj-radar-${{ matrix.target }}.tar.gz
 
   release:
-    needs: [build-wasm, build-cli, test, e2e]
+    needs: [build-wasm, build-cli, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -155,7 +145,7 @@ jobs:
       - name: Checksum the artifacts
         run: |
           cd dist
-          for f in zj_radar.wasm zj-radar-*.tar.gz; do
+          for f in zj_radar_agents.wasm zj-radar-*.tar.gz; do
             sha256sum "$f" > "$f.sha256"
           done
           cat ./*.sha256
@@ -168,8 +158,8 @@ jobs:
           # pipeline without misleading the curl|sh installer's /latest/ URL.
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/zj_radar.wasm
-            dist/zj_radar.wasm.sha256
+            dist/zj_radar_agents.wasm
+            dist/zj_radar_agents.wasm.sha256
             scripts/install.sh
             dist/zj-radar-*.tar.gz
             dist/zj-radar-*.tar.gz.sha256
@@ -177,19 +167,33 @@ jobs:
           generate_release_notes: true
 
   # ── The stranger test: README quickstart verbatim against THESE assets ──────
-  # RELEASING.md step 6, automated: a pristine container runs the installer,
-  # `setup zellij --download --inject --yes`, and a real Zellij on a PTY —
-  # asserting the pre-seeded grant (rail renders, no permission prompt) and
-  # cwd-driven tab naming. ZJ_RADAR_VERSION pins every download to this tag,
-  # so prereleases are covered and there is no `latest` race. Don't announce
-  # a release until this job is green.
-  verify-funnel:
+  # RELEASING.md step 6, automated. The old funnel drove
+  # `setup zellij --download --inject` and asserted on the rendered sidebar;
+  # both are gone — the indicator is now a `{pipe_agents}` widget the user
+  # declares in their own config.kdl, so there is no turnkey Zellij path left
+  # to funnel-test. What remains published turnkey is the installer, so that is
+  # what this verifies. ZJ_RADAR_VERSION pins the download to this tag, so
+  # prereleases are covered and there is no `latest` race.
+  verify-installer:
     needs: release
     runs-on: ubuntu-latest
     container: ubuntu:24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Run the fresh-machine funnel against the published assets
+      - name: Install the published CLI on a pristine box
         env:
           ZJ_RADAR_VERSION: ${{ github.ref_name }}
-        run: bash scripts/funnel.sh
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq >/dev/null
+          apt-get install -y -qq curl ca-certificates >/dev/null
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/marktoda/zj-radar/releases/download/${ZJ_RADAR_VERSION}/install.sh" | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          installed="$(zj-radar --version)"
+          echo "installed: $installed"
+          test "zj-radar ${ZJ_RADAR_VERSION#v}" = "$installed"
+          # The surviving subcommands must at least parse.
+          zj-radar notify generic --status running --msg funnel --dry-run >/dev/null
+          zj-radar setup --check || true

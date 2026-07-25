@@ -1,8 +1,8 @@
-//! The bounded-send argv for the status broadcast — how every producer should
-//! actually spawn `zellij pipe`.
+//! The bounded-send argv for the status fan-out — how every producer should
+//! actually spawn `zellij pipe` for all running radar instances.
 //!
 //! `zellij pipe` is a backpressure channel: the client process is held until
-//! **every** loaded plugin instance consumes the message, and an instance
+//! every targeted radar instance consumes the message, and a radar instance
 //! wedged at Zellij's permission prompt holds it forever. Producers fire at
 //! hook rate (one send per tool call), and each blocked client pins two FDs in
 //! the Zellij *server*, so an unbounded send turns one wedged rail into an
@@ -46,8 +46,19 @@ pub const DEFAULT_PIPE_TIMEOUT_SECS: u64 = 5;
 //    failure corner. The total fix — spawning the subtree in its own process
 //    group and group-killing from the producer's backstop — isn't worth the
 //    platform surface yet.
+// NOTE: deliberately NO `--plugin radar` here. `zellij pipe --plugin X`
+// LAUNCHES the plugin when Zellij considers it "not running" (identity
+// includes the caller's cwd), which spawned rogue floating rail instances
+// that silently swallowed every status. A name-only pipe broadcasts to all
+// loaded plugins; only the rail listens on this pipe name.
 const SELF_LIMITING_SEND: &str = concat!(
     "zellij pipe --name \"$2\" -- \"$3\" >/dev/null 2>&1 & p=$!; ",
+    "( sleep \"$1\"; kill \"$p\" ) >/dev/null 2>&1 & w=$!; ",
+    "wait \"$p\" 2>/dev/null; kill \"$w\" 2>/dev/null; exit 0",
+);
+
+const SELF_LIMITING_SESSION_SEND: &str = concat!(
+    "zellij --session \"$4\" pipe --name \"$2\" -- \"$3\" >/dev/null 2>&1 & p=$!; ",
     "( sleep \"$1\"; kill \"$p\" ) >/dev/null 2>&1 & w=$!; ",
     "wait \"$p\" 2>/dev/null; kill \"$w\" 2>/dev/null; exit 0",
 );
@@ -68,6 +79,26 @@ pub fn self_limiting_pipe_argv(payload: &str, timeout_secs: u64) -> Vec<String> 
     ]
 }
 
+/// Session-targeted variant for commands spawned by a Zellij plugin. Plugin
+/// subprocesses do not inherit the invoking client's session selection, so
+/// they must name the session explicitly.
+pub fn self_limiting_pipe_argv_for_session(
+    payload: &str,
+    timeout_secs: u64,
+    session_name: &str,
+) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        SELF_LIMITING_SESSION_SEND.to_string(),
+        "zj-radar-pipe".to_string(),  // $0
+        timeout_secs.to_string(),     // $1
+        STATUS_PIPE_NAME.to_string(), // $2
+        payload.to_string(),          // $3
+        session_name.to_string(),     // $4
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,7 +114,21 @@ mod tests {
         assert_eq!(argv[4], "5");
         assert_eq!(argv[5], STATUS_PIPE_NAME);
         assert_eq!(argv[6], r#"{"v":1,"msg":"a b; $(rm)"}"#);
+        assert!(argv[2].contains("zellij pipe --name"));
+        assert!(
+            !argv[2].contains("--plugin"),
+            "a --plugin pipe launches rogue instances when the rail is missing"
+        );
         assert!(!argv[2].contains("rm"), "script must not embed the payload");
+    }
+
+    #[test]
+    fn session_argv_targets_the_session_without_interpolating_it() {
+        let argv = self_limiting_pipe_argv_for_session("{}", 5, "work; $(rm)");
+        assert_eq!(argv[6], "{}");
+        assert_eq!(argv[7], "work; $(rm)");
+        assert!(argv[2].contains("zellij --session \"$4\" pipe"));
+        assert!(!argv[2].contains("work"));
     }
 
     #[test]

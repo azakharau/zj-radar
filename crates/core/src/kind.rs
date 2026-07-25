@@ -14,9 +14,9 @@ use crate::status::GlyphSet;
 /// rather than silently falling back.
 macro_rules! kinds {
     ( $( $variant:ident => $source:literal, $plain:literal, $nerd:literal );+ $(;)? ) => {
-        /// What kind of process owns a pane. Agents (Claude, Codex, Gemini) and
-        /// task types (Test, Build, Deploy, Server) are peers — only the mark
-        /// glyph differs; the renderer and sorter treat all variants identically.
+        /// What kind of process owns a pane. Agents (Claude, Codex, Gemini,
+        /// OpenCode, OMP) and task types (Test, Build, Deploy, Server) are
+        /// peers — only the mark glyph differs.
         ///
         /// Generated from the `kinds!` table below — see it for each variant's
         /// wire token and marks.
@@ -51,9 +51,8 @@ macro_rules! kinds {
             }
 
             /// Single-character identity mark shown before the activity. Glyph-set
-            /// aware: the Nerd set upgrades the three *agent* marks (thin
-            /// asterisk-family glyphs in Plain) to heavier font-native MDI icons;
-            /// task marks already read well, so most rows repeat one glyph.
+            /// aware: the Nerd set upgrades agent marks to heavier font-native
+            /// icons; task marks already read well, so most rows repeat one glyph.
             pub fn mark(self, set: GlyphSet) -> char {
                 match self {
                     $( Kind::$variant => match set {
@@ -67,9 +66,17 @@ macro_rules! kinds {
 }
 
 kinds! {
-    Claude  => "claude",  '✳', '\u{f06a9}'; // nf-md-robot
-    Codex   => "codex",   '❉', '\u{f167a}'; // nf-md-robot-outline
-    Gemini  => "gemini",  '✦', '\u{f0eb9}'; // nf-md-star-four-points (sparkle)
+    // Nerd-set agent marks are REAL vendor logos from the Simple Icons font
+    // (~/Library/Fonts/SimpleIcons.ttf, a ghostty fallback family). Base is
+    // simple-icons-font 16.27.0 — si-claude U+EC10, si-googlegemini U+EEA9,
+    // si-opencode U+F237 — plus the si-openai glyph grafted in from release
+    // 13.21.0 at the free codepoint U+F77C (OpenAI was removed upstream by a
+    // trademark takedown); omp is its π branding.
+    Claude  => "claude",  '✳', '\u{ec10}';
+    Codex   => "codex",   '❉', '\u{f77c}';
+    Gemini  => "gemini",  '✦', '\u{eea9}';
+    OpenCode => "opencode", '⬡', '\u{f237}';
+    Omp     => "omp",     '◈', 'π';
     Command => "command", '$', '$';
     Other   => "other",   '⦿', '⦿';
     Test    => "test",    '⚗', '⚗';
@@ -87,7 +94,7 @@ impl Kind {
     /// must declare which side it is here before it compiles.
     pub fn is_agent(self) -> bool {
         match self {
-            Kind::Claude | Kind::Codex | Kind::Gemini => true,
+            Kind::Claude | Kind::Codex | Kind::Gemini | Kind::OpenCode | Kind::Omp => true,
             Kind::Command | Kind::Other | Kind::Test | Kind::Build | Kind::Deploy
             | Kind::Server => false,
         }
@@ -111,6 +118,8 @@ mod tests {
         assert_eq!(Kind::from_source("claude"), Kind::Claude);
         assert_eq!(Kind::from_source("codex"), Kind::Codex);
         assert_eq!(Kind::from_source("gemini"), Kind::Gemini);
+        assert_eq!(Kind::from_source("opencode"), Kind::OpenCode);
+        assert_eq!(Kind::from_source("omp"), Kind::Omp);
         assert_eq!(Kind::from_source("command"), Kind::Command);
     }
 
@@ -147,6 +156,8 @@ mod tests {
         assert_eq!(Kind::Claude.mark(Plain), '✳');
         assert_eq!(Kind::Codex.mark(Plain), '❉');
         assert_eq!(Kind::Gemini.mark(Plain), '✦');
+        assert_eq!(Kind::OpenCode.mark(Plain), '⬡');
+        assert_eq!(Kind::Omp.mark(Plain), '◈');
         assert_eq!(Kind::Command.mark(Plain), '$');
         assert_eq!(Kind::Other.mark(Plain), '⦿');
         assert_eq!(Kind::Test.mark(Plain), '⚗');
@@ -156,12 +167,14 @@ mod tests {
     }
 
     #[test]
-    fn nerd_set_upgrades_agent_marks() {
+    fn nerd_set_uses_vendor_icons() {
         use GlyphSet::Nerd;
-        // Agent marks become heavier font-native MDI glyphs in the Nerd set.
-        assert_eq!(Kind::Claude.mark(Nerd), '\u{f06a9}');
-        assert_eq!(Kind::Codex.mark(Nerd), '\u{f167a}');
-        assert_eq!(Kind::Gemini.mark(Nerd), '\u{f0eb9}');
+        // Simple Icons brand glyphs (16.27.0 + grafted si-openai from 13.21.0).
+        assert_eq!(Kind::Claude.mark(Nerd), '\u{ec10}');
+        assert_eq!(Kind::Codex.mark(Nerd), '\u{f77c}');
+        assert_eq!(Kind::Gemini.mark(Nerd), '\u{eea9}');
+        assert_eq!(Kind::OpenCode.mark(Nerd), '\u{f237}');
+        assert_eq!(Kind::Omp.mark(Nerd), 'π');
         // Task marks are shared across sets.
         assert_eq!(Kind::Build.mark(Nerd), '⚙');
         assert_eq!(Kind::Command.mark(Nerd), '$');
@@ -184,7 +197,7 @@ mod tests {
     fn all_enumerates_every_variant() {
         // `ALL` drives the exhaustiveness of the other tests; pin its size so a
         // dropped table row is caught here instead of silently shrinking coverage.
-        assert_eq!(Kind::ALL.len(), 9);
+        assert_eq!(Kind::ALL.len(), 11);
         assert_eq!(Kind::Other.as_source(), "other");
     }
 

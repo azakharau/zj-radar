@@ -50,13 +50,12 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
       - uses: Swatinem/rust-cache@v2
       # --workspace --all-targets so test/example code is linted too;
-      # --all-features covers the off-by-default `e2e` flag.
       - name: clippy
         run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: deterministic suite (L1-L4)
         run: nix develop -c cargo test --workspace --all-features
       - name: wasm plugin compiles
-        run: nix develop -c cargo build --target wasm32-wasip1 -p zj-radar-plugin
+        run: nix develop -c cargo build --target wasm32-wasip1 -p zj-radar-agents
       - name: bash hook tests (L3, runs shellcheck + bats)
         run: nix develop -c just test-bash
 

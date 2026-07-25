@@ -1,25 +1,25 @@
-//! `zj-radar setup [claude|codex|zellij]` — idempotent, conflict-aware local
-//! wiring. Claude is wired through Claude Code's own plugin marketplace (we
-//! drive the `claude plugin` CLI, never its files); Codex gets hooks.json
-//! entries; Zellij setup installs the wasm at a stable path and manages the
-//! `radar` alias in `config.kdl`.
+//! `zj-radar setup [claude|codex]` — idempotent, conflict-aware local wiring for
+//! the agent producers. Claude is wired through Claude Code's own plugin
+//! marketplace (we drive the `claude plugin` CLI, never its files); Codex gets
+//! hooks.json entries.
+//!
+//! There is deliberately no `zellij` target. The status indicator is a
+//! `{pipe_agents}` widget in the user's own zjstatus bar, fed by the headless
+//! `zj-radar-agents` plugin — both declared in the user's `config.kdl` like any
+//! other plugin. Nothing about that is ours to install, inject, or own, so the
+//! wasm-installing / layout-injecting / session-launching layer is gone.
 
 mod analyze;
 mod check;
 mod claude;
 mod codex;
 mod detect;
-mod download;
 mod edit;
-mod preseed;
-mod zellij;
 pub(crate) use analyze::*;
 pub(crate) use check::*;
 pub(crate) use claude::*;
 pub(crate) use codex::*;
-pub(crate) use download::*;
 pub(crate) use edit::*;
-pub(crate) use zellij::*;
 
 use std::path::{Path, PathBuf};
 
@@ -40,55 +40,15 @@ pub(crate) const CODEX_HOOK_EVENTS: [&str; 7] = [
     "SubagentStop",
     "Stop",
 ];
-pub(crate) const ZELLIJ_ALIAS_BEGIN: &str = "// zj-radar: managed plugin alias begin";
-pub(crate) const ZELLIJ_ALIAS_END: &str = "// zj-radar: managed plugin alias end";
 
 pub struct SetupOptions<'a> {
     pub targets: &'a [String],
-    pub wasm: Option<&'a Path>,
-    /// Fetch the wasm matching this CLI's version instead of passing `--wasm`.
-    pub download: bool,
     pub uninstall: bool,
     pub dry_run: bool,
     pub yes: bool,
     pub check: bool,
     pub legacy_notify: bool,
     pub force: bool,
-    /// Non-interactive consent to inject the rail into the target layout.
-    pub inject: bool,
-    /// Layout name to inject into (`<config_dir>/layouts/<name>.kdl`).
-    /// `None` means `default`.
-    pub layout: Option<&'a str>,
-    /// Open the plugin in a focused floating pane so Zellij can prompt for
-    /// permissions (one-time grant). Exits after launching; skips wasm/alias/inject.
-    pub grant: bool,
-}
-
-/// Where the wasm artifact comes from. A total type so "both --wasm and
-/// --download" is a refusal at one place, not a runtime check inside the
-/// orchestrator.
-pub(crate) enum WasmSource {
-    None,
-    Path(PathBuf),
-    Download,
-}
-
-pub(crate) fn wasm_source(wasm: Option<&Path>, download: bool) -> Result<WasmSource, String> {
-    match (wasm, download) {
-        (Some(_), true) => Err("pass either --wasm <path> or --download, not both".to_string()),
-        (Some(p), false) => Ok(WasmSource::Path(p.to_path_buf())),
-        (None, true)     => Ok(WasmSource::Download),
-        (None, false)    => Ok(WasmSource::None),
-    }
-}
-
-pub(crate) struct ZellijSetupOpts<'a> {
-    wasm_source: WasmSource,
-    force:       bool,
-    inject:      bool,
-    layout:      Option<&'a str>,
-    dry_run:     bool,
-    yes:         bool,
 }
 
 pub(crate) struct CodexSetupOpts {
@@ -103,18 +63,15 @@ pub(crate) struct CodexSetupOpts {
 /// implicit in the order of `if` blocks.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    Grant,
     Check,
     Uninstall,
     Install,
 }
 
-/// Clap already hard-errors on `--check --uninstall` (and `--grant` with
-/// either), so the check-beats-uninstall rung is defensive, not a CLI surface.
-pub(crate) fn mode_from_flags(grant: bool, check: bool, uninstall: bool) -> Mode {
-    if grant {
-        Mode::Grant
-    } else if check {
+/// Clap already hard-errors on `--check --uninstall`, so the
+/// check-beats-uninstall rung is defensive, not a CLI surface.
+pub(crate) fn mode_from_flags(check: bool, uninstall: bool) -> Mode {
+    if check {
         Mode::Check
     } else if uninstall {
         Mode::Uninstall
@@ -131,62 +88,27 @@ pub(crate) fn which(bin: &str) -> bool {
 
 /// Entry point for `zj-radar setup`.
 pub fn run(options: SetupOptions<'_>) {
-    let mode = mode_from_flags(options.grant, options.check, options.uninstall);
+    let mode = mode_from_flags(options.check, options.uninstall);
 
-    if mode == Mode::Grant {
-        // Same cross-target hygiene as --inject/--layout below: --grant opens
-        // the ZELLIJ permission float, so `setup codex --grant` silently
-        // granting zellij would read as "codex got wired".
-        for a in options.targets.iter().filter(|a| a.as_str() != "zellij") {
-            eprintln!("zj-radar: --grant applies to the zellij target only — ignoring '{a}'");
-        }
-        if let Some(config_dir) = zellij_config_dir_or_report() {
-            run_grant(&config_dir);
-        }
-        return;
-    }
-
-    let bare = options.targets.is_empty() && options.wasm.is_none() && !options.download;
+    let bare = options.targets.is_empty();
     let want_codex = bare || options.targets.iter().any(|a| a == "codex");
     // Bare `setup` = detected agents only: claude joins codex there, and
     // `setup_claude` itself skips gracefully when the binary is absent.
     let want_claude = bare || options.targets.iter().any(|a| a == "claude");
-    let want_zellij = options.targets.iter().any(|a| a == "zellij")
-        || options.wasm.is_some()
-        || options.download;
     for a in options
         .targets
         .iter()
-        .filter(|a| !matches!(a.as_str(), "claude" | "codex" | "zellij"))
+        .filter(|a| !matches!(a.as_str(), "claude" | "codex"))
     {
-        crate::exit::fail_report("zj-radar", format!("setup does not support '{a}' (supported: claude, codex, zellij). Skipping."));
-    }
-    // Cross-target flag hygiene: `--wasm`/`--download` *imply* the zellij
-    // target (they're zellij artifacts, see `want_zellij`), but `--inject`/
-    // `--layout` do not — silently ignoring them on a codex-only invocation
-    // would read as "injected". Say so instead.
-    if !want_zellij {
-        if options.inject {
-            eprintln!("zj-radar: --inject applies to the zellij target only — add `zellij` to the targets to use it");
-        }
-        if options.layout.is_some() {
-            eprintln!("zj-radar: --layout applies to the zellij target only — add `zellij` to the targets to use it");
-        }
-    }
-    if want_zellij && options.legacy_notify && !want_codex {
-        eprintln!("zj-radar: --legacy-notify applies to the codex target only — add `codex` to the targets to use it");
+        crate::exit::fail_report(
+            "zj-radar",
+            format!("setup does not support '{a}' (supported: claude, codex). Skipping."),
+        );
     }
 
     if mode == Mode::Check {
-        // Bare `--check` is the doctor: inspect BOTH halves. (A bare *install*
-        // defaults to codex-only because a zellij install needs a wasm source;
-        // checking needs none, and a user asking "is my install healthy?"
-        // wants the rail's state too, not silence about it.)
-        let both = options.targets.is_empty();
+        let both = bare;
         let mut missing = false;
-        if want_zellij || both {
-            missing |= check_zellij(options.layout);
-        }
         if want_codex || both {
             missing |= check_codex(options.legacy_notify);
         }
@@ -198,38 +120,14 @@ pub fn run(options: SetupOptions<'_>) {
             missing |= check_claude();
         }
         if missing {
-            // The items above are the diagnostic; this sets the exit code so
-            // `zj-radar setup --check && zj-radar run` can gate on the doctor.
+            // The items above are the diagnostic; this sets the exit code so a
+            // caller can gate on the doctor.
             crate::exit::fail_report("zj-radar", "check found missing items (listed above)");
         }
         return;
     }
 
     let uninstall = mode == Mode::Uninstall;
-    if want_zellij {
-        let wasm_source = if uninstall {
-            WasmSource::None
-        } else {
-            match wasm_source(options.wasm, options.download) {
-                Ok(s) => s,
-                Err(e) => {
-                    crate::exit::fail_report("zellij", format!("refused — {e}"));
-                    return;
-                }
-            }
-        };
-        setup_zellij(
-            uninstall,
-            ZellijSetupOpts {
-                wasm_source,
-                force:   options.force,
-                inject:  options.inject,
-                layout:  options.layout,
-                dry_run: options.dry_run,
-                yes:     options.yes,
-            },
-        );
-    }
     if want_codex {
         setup_codex(
             uninstall,
@@ -328,22 +226,7 @@ pub(crate) fn path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf 
 mod tests {
     use super::*;
 
-    #[test]
-    fn wasm_source_rejects_both_path_and_download() {
-        let p = std::path::Path::new("/x.wasm");
-        assert!(matches!(wasm_source(Some(p), false), Ok(WasmSource::Path(_))));
-        assert!(matches!(wasm_source(None, true), Ok(WasmSource::Download)));
-        assert!(matches!(wasm_source(None, false), Ok(WasmSource::None)));
-        assert!(wasm_source(Some(p), true).is_err(), "both --wasm and --download must refuse");
-    }
 
-    #[test]
-    fn mode_precedence_grant_beats_check_beats_uninstall() {
-        assert!(matches!(mode_from_flags(true, true, true), Mode::Grant));
-        assert!(matches!(mode_from_flags(false, true, true), Mode::Check));
-        assert!(matches!(mode_from_flags(false, false, true), Mode::Uninstall));
-        assert!(matches!(mode_from_flags(false, false, false), Mode::Install));
-    }
 
     #[test]
     fn write_atomic_aborts_when_backup_cannot_be_written() {

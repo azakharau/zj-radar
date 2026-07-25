@@ -17,8 +17,14 @@ const CLAUDE_PLUGIN: &str = "zj-radar-claude";
 /// The qualified id `claude plugin install` takes.
 const CLAUDE_PLUGIN_ID: &str = "zj-radar-claude@zj-radar";
 
+/// True iff Claude Code's installed-plugins manifest lists zj-radar's producer
+/// plugin (`zj-radar-claude`). `None`/empty input returns `false`.
+pub(crate) fn claude_producer_wired(installed_plugins_json: Option<&str>) -> bool {
+    installed_plugins_json.is_some_and(|s| s.contains(CLAUDE_PLUGIN))
+}
+
 pub(crate) fn setup_claude(uninstall: bool, dry_run: bool, yes: bool) {
-    let wired = crate::run::claude_producer_wired(claude_installed_plugins_text().as_deref());
+    let wired = claude_producer_wired(claude_installed_plugins_text().as_deref());
     if uninstall {
         uninstall_claude(wired, dry_run, yes);
     } else {

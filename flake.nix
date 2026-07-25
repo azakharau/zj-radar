@@ -63,14 +63,14 @@
         nativeBuildInputs = [pkgs.pkg-config];
       };
 
-      # ── wasm plugin artifact (the `zj-radar-plugin` member, → wasm32-wasip1) ──
+      # ── wasm plugin artifact (the `zj-radar-agents` member, → wasm32-wasip1) ──
       wasmArgs =
         commonArgs
         // {
           CARGO_BUILD_TARGET = "wasm32-wasip1";
           # Build only the plugin member: the `zj-radar` CLI crate is a host
           # binary (clap/dirs deps) that can't target wasm.
-          cargoExtraArgs = "-p zj-radar-plugin";
+          cargoExtraArgs = "-p zj-radar-agents";
           doCheck = false; # wasm can't execute on the host builder; see `checks` for tests
         };
       cargoArtifactsWasm = craneLib.buildDepsOnly wasmArgs;
@@ -80,10 +80,11 @@
           doInstallCargoArtifacts = false;
           # Install the wasm to $out/bin to match the Zellij-plugin convention
           # (e.g. zjstatus → ${pkgs.zjstatus}/bin/zjstatus.wasm), so downstream
-          # layouts reference ${pkg}/bin/zj_radar.wasm like every other plugin.
+          # config.kdl's `load_plugins` references ${pkg}/bin/zj_radar_agents.wasm
+          # like every other plugin.
           installPhaseCommand = ''
             mkdir -p $out/bin
-            cp target/wasm32-wasip1/release/zj_radar.wasm $out/bin/zj_radar.wasm
+            cp target/wasm32-wasip1/release/zj_radar_agents.wasm $out/bin/zj_radar_agents.wasm
           '';
         });
 
@@ -91,14 +92,12 @@
       cargoArtifactsHost = craneLib.buildDepsOnly commonArgs;
 
       # ── native CLI (host target; `crates/cli` workspace member) ──
-      # The CLI embeds the wasm (build.rs → include_bytes!). Feed it the wasm
-      # built above via ZJ_RADAR_WASM_PATH so the build doesn't recurse into a
-      # nested wasm compile (which the crane sandbox can't do).
+      # The CLI carries no wasm payload: the aggregator plugin is a separate
+      # artifact the user declares in their own config.kdl.
       cliArgs =
         commonArgs
         // {
           cargoExtraArgs = "-p zj-radar";
-          ZJ_RADAR_WASM_PATH = "${zj-radar}/bin/zj_radar.wasm";
         };
       cargoArtifactsCli = craneLib.buildDepsOnly (commonArgs // {cargoExtraArgs = "-p zj-radar";});
       zj-radar-cli = craneLib.buildPackage (cliArgs
@@ -115,23 +114,14 @@
 
       checks = {
         inherit zj-radar;
-        # The workspace checks compile the CLI member, whose build.rs embeds a
-        # wasm: without ZJ_RADAR_WASM_PATH it falls back to a NESTED
-        # `cargo build --target wasm32-wasip1` into the same workspace, which
-        # deadlocks inside the sandbox (the inner cargo waits on the build-dir
-        # lock the outer cargo holds while running build scripts, with no
-        # network to fail fast) — the job hangs until the CI timeout. Feed the
-        # prebuilt wasm here exactly like cliArgs does.
         clippy = craneLib.cargoClippy (commonArgs
           // {
             cargoArtifacts = cargoArtifactsHost;
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
-            ZJ_RADAR_WASM_PATH = "${zj-radar}/bin/zj_radar.wasm";
           });
         test = craneLib.cargoTest (commonArgs
           // {
             cargoArtifacts = cargoArtifactsHost;
-            ZJ_RADAR_WASM_PATH = "${zj-radar}/bin/zj_radar.wasm";
           });
         cli-test = craneLib.cargoTest (cliArgs
           // {

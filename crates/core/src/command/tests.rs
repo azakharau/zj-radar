@@ -44,8 +44,20 @@
         // The agent's own exe in the foreground vouches for the pushed status.
         assert!(is_agent_foreground(&argv(&["claude"]), true));
         assert!(is_agent_foreground(&argv(&["codex"]), true));
+        assert!(is_agent_foreground(&argv(&["omp"]), true));
+        assert!(is_agent_foreground(&argv(&["opencode"]), true));
         // Env/wrapper prefixes are peeled, mirroring is_shell_prompt.
         assert!(is_agent_foreground(&argv(&["env", "FOO=1", "claude"]), true));
+        // The native remote bridge is a push producer, not command work.
+        assert!(is_agent_foreground(&argv(&["zj-radar", "remote", "host", "work"]), true));
+        assert!(is_agent_foreground(
+            &argv(&["/Users/me/.local/bin/zj-radar", "remote", "host", "work"]),
+            true,
+        ));
+        assert!(!is_shell_prompt(
+            &argv(&["/Users/me/.local/bin/zj-radar", "remote", "host", "work"]),
+            true,
+        ));
         // Background, shells, ordinary commands, and nothing don't vouch.
         assert!(!is_agent_foreground(&argv(&["claude"]), false));
         assert!(!is_agent_foreground(&argv(&["zsh"]), true));
@@ -233,6 +245,23 @@
         store.on_command_changed(1, &argv(&["sudo", "claude"]), true, Some("/work/repo"), 1);
         store.on_timer(Tick(2), EpochSecs(0));
         assert!(store.get(1).is_none(), "wrapped agent must stay suppressed");
+    }
+
+    #[test]
+    fn omp_without_a_reliable_push_producer_returns_to_the_shell() {
+        let mut store = CommandStore::default();
+
+        store.on_command_changed(1, &argv(&["omp", "--resume"]), true, Some("/work/repo"), 1);
+        store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+        let running = store.get(1).expect("OMP must be visible while it owns the pane");
+        assert_eq!(running.status, Status::Running);
+        assert_eq!(running.kind, Kind::Omp);
+
+        store.on_command_changed(1, &argv(&["fish"]), true, Some("/work/repo"), 4);
+        store.on_timer(Tick(4 + DEBOUNCE_TICKS), EpochSecs(10));
+        let done = store.get(1).expect("returning to fish must finish OMP");
+        assert_eq!(done.status, Status::Done);
+        assert_eq!(done.kind, Kind::Omp);
     }
 
     #[test]
@@ -776,19 +805,48 @@
     }
 
     #[test]
-    fn gemini_foreground_command_is_tracked() {
-        // Gemini has no push adapter (the shipped scope is Claude + Codex), so
-        // unlike them it is *observed* via command-tracking rather than
-        // suppressed — otherwise its panes would show nothing at all. It carries
-        // its own `Kind::Gemini` source so it renders with the gemini mark.
+    fn push_wrapper_clears_stale_command_observation_instead_of_running_forever() {
         let mut store = CommandStore::default();
-        store.on_command_changed(1, &["gemini".to_string()], true, Some("/work/repo"), 1);
-        store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
-        let s = store
-            .get(1)
-            .expect("gemini must leave a resolved command observation");
-        assert_eq!(s.status, Status::Running);
-        assert_eq!(s.kind, Kind::Gemini);
+        store.insert_snapshot_observation(
+            6,
+            TrackedObservation::command(
+                Status::Running,
+                String::new(),
+                "zj-radar remote host work".to_string(),
+                Kind::Command,
+                1,
+            ),
+        );
+
+        let removed = store.on_command_changed(
+            6,
+            &argv(&["/Users/me/.local/bin/zj-radar", "remote", "host", "work"]),
+            true,
+            None,
+            2,
+        );
+
+        assert!(
+            removed && store.get(6).is_none(),
+            "push wrapper must remove command-origin state"
+        );
+    }
+
+    #[test]
+    fn unadapted_agent_foreground_commands_are_tracked() {
+        // Known agent identities without a push adapter remain eligible for command tracking.
+        for (pane_id, source, expected_kind) in
+            [(1, "gemini", Kind::Gemini), (2, "opencode", Kind::OpenCode), (3, "omp", Kind::Omp)]
+        {
+            let mut store = CommandStore::default();
+            store.on_command_changed(pane_id, &[source.to_string()], true, Some("/work/repo"), 1);
+            store.on_timer(Tick(1 + DEBOUNCE_TICKS), EpochSecs(0));
+            let observation = store
+                .get(pane_id)
+                .expect("unadapted agent must leave a command observation");
+            assert_eq!(observation.status, Status::Running);
+            assert_eq!(observation.kind, expected_kind);
+        }
     }
 
     // ── B: leaving the foreground is debounced before flipping to Done ──

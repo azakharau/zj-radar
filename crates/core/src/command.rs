@@ -56,18 +56,21 @@ pub struct TimerReport {
     pub receded: Vec<(u32, TrackedObservation)>,
 }
 
-/// Shell/prompt programs that signal "back to the prompt" rather than a real
-/// foreground command. Missing a shell here degrades that shell's users twice:
-/// their prompt tracks as a perpetual Running command, AND `is_shell_prompt`
-/// never fires, so a finished agent's pushed status is never exit-cleared —
-/// hence the broad list. `direnv` is here because its `direnv export <shell>`
-/// hook runs on *every* prompt to sync the environment — tracking it would open
-/// a spurious command lifecycle after each real command and notify "direnv"
-/// instead of the command that just finished.
-const IGNORE_NAMES: &[&str] = &[
-    "zsh", "bash", "fish", "sh", "dash", "ash", "ksh", "mksh", "tcsh", "csh",
-    "nu", "nushell", "pwsh", "elvish", "xonsh", "starship", "direnv",
+/// Shell programs that can be the pane's parent prompt. Missing one degrades
+/// that shell's users twice: the prompt tracks as a perpetual Running command,
+/// and a finished agent's pushed status is never exit-cleared.
+const SHELL_NAMES: &[&str] = &[
+    "zsh", "bash", "fish", "sh", "dash", "ash", "ksh", "mksh", "tcsh", "csh", "nu", "nushell",
+    "pwsh", "elvish", "xonsh",
 ];
+
+/// Prompt helpers are ignored as command work but cannot prove that a
+/// shell-launched producer returned to its parent shell.
+const PROMPT_HELPER_NAMES: &[&str] = &["starship", "direnv"];
+
+fn is_ignored_program(name: &str) -> bool {
+    SHELL_NAMES.contains(&name) || PROMPT_HELPER_NAMES.contains(&name)
+}
 
 /// Binaries of the *push*-instrumented agents. These report via the
 /// `zj_radar.status.v1` pipe from their hooks, so the command observer must
@@ -83,6 +86,10 @@ const IGNORE_NAMES: &[&str] = &[
 /// deliberately absent: they fall through to ordinary command-tracking, which
 /// still surfaces a Running/Done lifecycle under their own `Kind`.
 pub const AGENT_NAMES: &[&str] = &["claude", "codex"];
+
+/// Long-lived processes whose lifecycle is reported through status pushes,
+/// not command observation. `zj-radar remote` owns the embedded SSH bridge.
+const PUSH_PRODUCER_NAMES: &[&str] = &["zj-radar"];
 
 /// A pending foreground command awaiting debounce promotion.
 struct Pending {
@@ -325,13 +332,17 @@ fn apply_tool_rule(exe: &str, args: &[String], rule: &ToolRule) -> String {
     raw_display(&[exe, verb])
 }
 
-/// Is this exe basename a Python interpreter (`python`, `python3`,
-/// `python3.12`, `python2`)? Anything after the literal `python` must be
-/// version-shaped (digits/dots only), so python-adjacent tools
+/// Is this exe basename a Python interpreter (`python`, framework-style
+/// `Python`, `python3`, `python3.12`, `python2`)? Anything after the literal
+/// name must be version-shaped (digits/dots only), so python-adjacent tools
 /// (`python-config`, `python-build`) keep the ordinary first-arg treatment.
 fn is_python_interpreter(exe: &str) -> bool {
-    exe.strip_prefix("python")
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    exe.get(..6)
+        .zip(exe.get(6..))
+        .is_some_and(|(prefix, rest)| {
+            prefix.eq_ignore_ascii_case("python")
+                && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
 }
 
 /// `python -m <module>` has its own shape (the `-m` flag, plus a `pytest`
@@ -448,36 +459,65 @@ fn effective_program(command: &[String]) -> (&[String], &str) {
     (command, name)
 }
 
-/// Whether a `CommandChanged` means the pane is back at a shell prompt rather
-/// than running something we (or an agent) own. True when there is no foreground
-/// command, or the foreground is a shell/prompt program (`IGNORE_NAMES`). An
-/// agent (`AGENT_NAMES`) in the foreground is deliberately NOT "at the prompt" —
-/// the agent still owns the pane and drives it via the push pipe.
+fn is_push_producer(command: &[String], name: &str) -> bool {
+    PUSH_PRODUCER_NAMES.contains(&name)
+        || (is_python_interpreter(name)
+            && first_non_option(command, 1)
+                .is_some_and(|(_, script)| PUSH_PRODUCER_NAMES.contains(&basename(script))))
+}
+
+/// Whether the pane's root terminal process owns its lifecycle through the
+/// push pipe. `PaneUpdate` uses this to distinguish a producer's long-lived
+/// child processes from ordinary foreground commands.
+pub fn is_push_producer_program(program: &str) -> bool {
+    PUSH_PRODUCER_NAMES.contains(&program_name(program))
+}
+
+/// Whether this foreground edge identifies a process whose child commands are
+/// owned by the status pipe rather than the command observer.
+pub fn is_push_producer_foreground(command: &[String], is_foreground: bool) -> bool {
+    if !is_foreground {
+        return false;
+    }
+    let (command, name) = effective_program(command);
+    is_push_producer(command, name)
+}
+
+/// Whether a `CommandChanged` is precise evidence that a shell-launched
+/// producer returned to its parent prompt. A foreground shell counts only
+/// when its peeled argv is bare: `zsh -c ...` and other child-shell commands
+/// still belong to the producer. No foreground command remains the other
+/// Zellij representation of a prompt.
 pub fn is_shell_prompt(command: &[String], is_foreground: bool) -> bool {
     if !is_foreground {
         return true;
     }
-    let (_, name) = effective_program(command);
-    IGNORE_NAMES.contains(&name)
+    let (command, name) = effective_program(command);
+    command.len() == 1 && SHELL_NAMES.contains(&name)
 }
 
-/// Whether an instrumented agent (`AGENT_NAMES`) itself is the pane's live
-/// foreground command — direct evidence the pushed status's producer is still
-/// running. Used to cancel the stale-Running grace clock after a mid-turn
-/// foreground flicker resolves back to the agent.
+/// Whether a known agent identity or generic push producer itself is the pane's
+/// live foreground command — direct evidence the pushed status's producer is
+/// still running. This recognizes every agent [`Kind`] without adding it to
+/// [`AGENT_NAMES`]: agents without a push adapter still use ordinary command
+/// tracking, while any status they do push gets correct foreground liveness.
+/// Used to cancel the stale-Running grace clock after a mid-turn foreground
+/// flicker resolves back to the producer.
 pub fn is_agent_foreground(command: &[String], is_foreground: bool) -> bool {
     if !is_foreground {
         return false;
     }
-    let (_, name) = effective_program(command);
-    AGENT_NAMES.contains(&name)
+    let (command, name) = effective_program(command);
+    Kind::from_source(name).is_agent() || is_push_producer(command, name)
 }
 
 impl CommandStore {
     /// Handle a `CommandChanged` event for a terminal pane.
     ///
     /// `command` is the argv reported by Zellij. `cwd` is the pane's
-    /// last-known cwd (None if unknown). `tick` is the current tick.
+    /// last-known cwd (None if unknown). `tick` is the current tick. Returns
+    /// `true` only when identifying a push producer removed a stale
+    /// command-origin observation that must be persisted.
     pub fn on_command_changed(
         &mut self,
         pane_id: u32,
@@ -485,14 +525,17 @@ impl CommandStore {
         is_foreground: bool,
         cwd: Option<&str>,
         tick: u64,
-    ) {
+    ) -> bool {
         // Peel env-prefixes/wrappers once at intake so the ignore check, the
         // display string, and the Kind all classify the real command.
         let (command, name) = effective_program(command);
+        if is_push_producer(command, name) {
+            return self.clear_push_owned(pane_id);
+        }
         // Shells and agents are both "not a real command we track here": shells
         // mean back-to-the-prompt; agents are owned by the push pipe (see
         // AGENT_NAMES). Either way we never open a command lifecycle for them.
-        let in_ignore_set = IGNORE_NAMES.contains(&name) || AGENT_NAMES.contains(&name);
+        let in_ignore_set = is_ignored_program(name) || AGENT_NAMES.contains(&name);
 
         if !is_foreground || in_ignore_set {
             // The foreground command (if any) has ended: clear pending and, if a
@@ -517,7 +560,7 @@ impl CommandStore {
             let (cmd_string, kind) = classify(command);
             if cmd_string.is_empty() {
                 // Unknown/empty argv — never surface a blank Running row.
-                return;
+                return false;
             }
 
             // A genuine new run opens here: forget any prior run's exit so its
@@ -539,6 +582,16 @@ impl CommandStore {
                 },
             );
         }
+        false
+    }
+
+    /// Remove command-origin state from a pane whose root process reports
+    /// lifecycle through the push pipe.
+    pub fn clear_push_owned(&mut self, pane_id: u32) -> bool {
+        self.pending.remove(&pane_id);
+        self.pending_done.remove(&pane_id);
+        self.exited.remove(&pane_id);
+        self.store.remove(pane_id).is_some()
     }
 
     /// Timer tick: promote any pending fg command that has survived the

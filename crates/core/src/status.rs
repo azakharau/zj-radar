@@ -109,7 +109,7 @@ statuses! {
     //  variant    wire         role             plain  nerd
     Idle    => "idle",    Role::Muted,     '○', '\u{eb83}';
     Done    => "done",    Role::Success,   '●', '\u{f058}';
-    Running => "running", Role::Working,   '⠋', '\u{f110}';
+    Running => "running", Role::Working,   '⣿', '\u{f110}';
     Pending => "pending", Role::Attention, '◆', '\u{f0f3}';
     Error   => "error",   Role::Error,     '✗', '\u{f057}';
 }
@@ -195,10 +195,11 @@ impl GlyphSet {
     }
 }
 
-/// Working status glyph animation (both glyph sets): braille dots
-/// ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏.
-pub fn working_spin(frame: usize) -> char {
-    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Working status glyph animation (both glyph sets): a 3×4 dot grid encoded
+/// in two braille cells, with a four-dot, one-dot-thick snake moving clockwise
+/// around the perimeter (10 positions → 10 frames).
+pub fn working_spin(frame: usize) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠉⠃", "⠈⠇", "⠀⡇", "⢀⡆", "⣀⡄", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁"];
     FRAMES[frame % FRAMES.len()]
 }
 
@@ -313,8 +314,8 @@ mod tests {
     fn plain_glyphs_use_geometric_shapes() {
         use GlyphSet::Plain;
         assert_eq!(Status::Idle.glyph_for(Plain), '○');
-        assert_eq!(Status::Running.glyph_for(Plain), '⠋');
-        assert_eq!(Status::Pending.glyph_for(Plain), '◆'); // moved from ◑ to ◆
+        assert_eq!(Status::Running.glyph_for(Plain), '⣿');
+        assert_eq!(Status::Pending.glyph_for(Plain), '◆');
         assert_eq!(Status::Done.glyph_for(Plain), '●');
         assert_eq!(Status::Error.glyph_for(Plain), '✗');
     }
@@ -335,11 +336,12 @@ mod tests {
     }
 
     #[test]
-    fn working_spinner_cycles_braille_dots() {
-        assert_eq!(working_spin(0), '⠋');
-        assert_eq!(working_spin(1), '⠙');
-        assert_eq!(working_spin(9), '⠏');
-        assert_eq!(working_spin(10), '⠋'); // wraps
+    fn working_spinner_snakes_clockwise_around_the_ring() {
+        let frames = ["⠉⠃", "⠈⠇", "⠀⡇", "⢀⡆", "⣀⡄", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁"];
+        for (frame, expected) in frames.into_iter().enumerate() {
+            assert_eq!(working_spin(frame), expected);
+        }
+        assert_eq!(working_spin(frames.len()), frames[0]);
     }
 
     #[test]

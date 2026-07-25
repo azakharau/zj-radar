@@ -9,7 +9,6 @@ rust-version.workspace = true
 readme = "../../README.md"
 keywords = ["zellij", "claude", "agent", "cli", "tui"]
 categories = ["command-line-utilities", "development-tools"]
-build = "build.rs"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/zj-radar-{ target }.tar.gz"

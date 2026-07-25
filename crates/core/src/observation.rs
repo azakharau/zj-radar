@@ -68,7 +68,7 @@ pub struct TrackedObservation {
     #[serde(default)]
     pub pending_epoch_s: Option<u64>,
     /// The user has already seen this status (the payload rode in with
-    /// `ack: true` — the rail's right-click acknowledge). The notifier skips
+    /// `ack: true` — the rail's pending-row acknowledgement). The notifier skips
     /// acknowledged observations outright; everything else treats them like
     /// any other status. Overwritten fresh on every intake, so the exemption
     /// lasts exactly as long as the acknowledged status itself. Serde-defaulted
@@ -147,6 +147,13 @@ impl ObservationStore {
     /// completion leaving the card, which `RadarState` may ledger.
     pub fn insert(&mut self, pane_id: u32, observation: TrackedObservation) -> Option<TrackedObservation> {
         self.map.insert(pane_id, observation)
+    }
+
+    /// Remove one observation without creating a completion edge. Used when a
+    /// process is identified as a push producer rather than command work, and
+    /// by the `gone` payload (the producer says the agent exited).
+    pub fn remove(&mut self, pane_id: u32) -> Option<TrackedObservation> {
+        self.map.remove(&pane_id)
     }
 
     /// Prune every entry not in `live`, returning *every* dropped observation.
