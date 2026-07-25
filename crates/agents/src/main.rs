@@ -13,9 +13,16 @@ mod plugin {
     use zj_radar_agents::{Agents, Config};
     use zj_radar_core::{parse, STATUS_PIPE_NAME};
 
-    /// The domain clock ticks once per second. There is no animation to drive —
-    /// the status glyphs are static — so this exists only to age entries out.
-    const TICK_SECS: f64 = 1.0;
+    /// Frequency of the one timer this plugin keeps armed. There is no animation
+    /// to drive — the status glyphs are static — so this exists only to (a) age
+    /// entries out and (b) carry the publish that `pipe` deliberately defers,
+    /// which is why it is sub-second: an agent hook must reach the bar in well
+    /// under a second.
+    const TICK_SECS: f64 = 0.25;
+
+    /// Ticks per wall-clock second, for converting the tick counter into the
+    /// seconds that `Agents::expire` reasons about.
+    const TICKS_PER_SEC: u64 = 4;
 
     #[derive(Default)]
     pub struct AgentsPlugin {
@@ -32,6 +39,10 @@ mod plugin {
         /// thing standing between an idle session and a continuously
         /// repainting status bar.
         last_published: Option<String>,
+        /// State changed and the bar has not been told yet. Set by `pipe` and
+        /// drained by the next `Timer`; see `pipe` for why the publish cannot
+        /// happen inline.
+        dirty: bool,
     }
 
     impl ZellijPlugin for AgentsPlugin {
@@ -55,7 +66,9 @@ mod plugin {
             match event {
                 Event::Timer(_) => {
                     self.tick += 1;
-                    if self.agents.expire(self.tick, &self.config) {
+                    let expired = self.agents.expire(self.tick / TICKS_PER_SEC, &self.config);
+                    if self.dirty || expired {
+                        self.dirty = false;
                         self.publish();
                     }
                     set_timeout(TICK_SECS);
@@ -68,20 +81,36 @@ mod plugin {
             false
         }
 
+        /// Fold one agent status in and return IMMEDIATELY. This handler must do
+        /// no host I/O at all — in particular it must NOT publish.
+        ///
+        /// `zellij pipe` blocks its client until every recipient plugin has
+        /// returned from `pipe` (`zellij-server/src/plugins/pipes.rs:124`
+        /// releases the CLI pipe only once `currently_being_processed_by` is
+        /// empty). Calling `pipe_message_to_plugin` from inside this handler
+        /// fans a new message out to every plugin instance while the CLI pipe
+        /// that triggered it is still outstanding; under repeated hook traffic
+        /// that wedges the server's wasm thread permanently — every subsequent
+        /// `zellij pipe` AND `zellij action` blocks forever, session-wide.
+        /// (Observed: fine for a handful of sends, dead after a burst of ten.)
+        ///
+        /// So: record, mark dirty, return. The next `Timer` publishes, ≤250 ms
+        /// later, safely outside the pipe's critical section. This is also why
+        /// `zellij-resource-status` — the working precedent — only ever
+        /// publishes from `update`.
         fn pipe(&mut self, message: PipeMessage) -> bool {
             if message.name != STATUS_PIPE_NAME {
                 return false;
             }
             if let Some(raw) = message.payload.as_deref() {
                 if let Some(payload) = parse(raw) {
-                    if self.agents.apply(&payload, self.tick) {
-                        self.publish();
+                    if self.agents.apply(&payload, self.tick / TICKS_PER_SEC) {
+                        self.dirty = true;
                     }
                 }
             }
-            // Returning false takes Zellij's fast path, which releases the
-            // blocked CLI pipe immediately instead of deferring it until after a
-            // render round-trip. Every agent hook is waiting on that release.
+            // `false` also takes Zellij's fast path, which releases the blocked
+            // CLI pipe without waiting on a render round-trip.
             false
         }
     }
@@ -100,20 +129,21 @@ mod plugin {
                 }
             }
 
-            let mut changed = self.agents.retain_panes(&live_terminals);
+            if self.agents.retain_panes(&live_terminals) {
+                self.dirty = true;
+            }
             if !plugin_panes.is_subset(&self.known_plugin_panes) {
-                // A zjstatus instance we have never published to. Drop the dedup
-                // cache so the next publish actually goes out and seeds it.
+                // A zjstatus instance we have never published to (a new tab).
+                // Drop the dedup cache so the next publish actually goes out and
+                // seeds it instead of being suppressed as "unchanged".
                 self.last_published = None;
-                changed = true;
+                self.dirty = true;
             }
             self.known_plugin_panes = plugin_panes;
-
-            if changed {
-                self.publish();
-            }
         }
 
+        /// The ONE place that talks to other plugins. Reached only from the
+        /// `Timer` arm, never from `pipe` — see `pipe` for why that matters.
         fn publish(&mut self) {
             let payload = self.config.pipe_payload(&self.agents.render(self.config.glyphs()));
             if self.last_published.as_deref() == Some(payload.as_str()) {
